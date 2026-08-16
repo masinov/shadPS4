@@ -7,6 +7,7 @@
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
+#include "core/veh_stack.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -29,7 +30,7 @@ namespace Core {
 
 #if defined(_WIN32)
 
-static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+static long SignalHandlerImpl(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
     DWORD code = 0;
 
@@ -62,6 +63,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     // Vectored handlers run before frame-based SEH and language-runtime handlers. Exceptions that
     // do not belong to the emulator must continue through normal Windows dispatch.
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+#ifdef _WIN64
+    return static_cast<LONG>(RunOnVehStack(SignalHandlerImpl, pExp));
+#else
+    return static_cast<LONG>(SignalHandlerImpl(pExp));
+#endif
 }
 
 #else

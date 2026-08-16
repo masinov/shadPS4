@@ -88,17 +88,17 @@ int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
         }
 
         // Open the param.sfo in this folder
-        PSF* dlc_params = new PSF();
         const auto& param_sfo_path = entry.path() / "sce_sys/param.sfo";
         if (!std::filesystem::exists(param_sfo_path)) {
             // This folder doesn't have a param.sfo
             continue;
         }
-        dlc_params->Open(param_sfo_path);
+        PSF dlc_params;
+        dlc_params.Open(param_sfo_path);
 
         // Validate the available params
-        auto category = dlc_params->GetString("CATEGORY");
-        auto content_id = dlc_params->GetString("CONTENT_ID");
+        auto category = dlc_params.GetString("CATEGORY");
+        auto content_id = dlc_params.GetString("CONTENT_ID");
         if (!category.has_value() || strncmp(category.value().data(), "ac", 2) != 0 ||
             !content_id.has_value() ||
             content_id.value().length() <= ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET) {
@@ -315,13 +315,13 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
             }
 
             // Open the param.sfo, make sure it's actually for additional content.
-            PSF* dlc_params = new PSF();
-            dlc_params->Open(param_sfo_path);
+            PSF dlc_params;
+            dlc_params.Open(param_sfo_path);
 
-            auto category = dlc_params->GetString("CATEGORY");
+            auto category = dlc_params.GetString("CATEGORY");
             if (category.has_value() && strncmp(category.value().data(), "ac", 2) == 0) {
                 // We've located additional content. Find the entitlement id from the content id.
-                auto content_id = dlc_params->GetString("CONTENT_ID");
+                auto content_id = dlc_params.GetString("CONTENT_ID");
                 if (!content_id.has_value()) {
                     LOG_WARNING(Lib_AppContent,
                                 "Additonal content {} param.sfo is missing CONTENT_ID",

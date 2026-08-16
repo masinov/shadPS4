@@ -244,24 +244,48 @@ void UploadTextureData::Upload() {
         std::unique_lock lk(bd->command_pool_mutex);
         v.device.freeCommandBuffers(bd->command_pool, {command_buffer});
     }
+    command_buffer = VK_NULL_HANDLE;
     upload_buffer = VK_NULL_HANDLE;
     upload_buffer_memory = VK_NULL_HANDLE;
 }
 
 void UploadTextureData::Destroy() {
     VkData* bd = GetBackendData();
+    if (bd == nullptr) {
+        return;
+    }
     const InitInfo& v = bd->init_info;
 
     CheckVkErr(v.device.waitIdle());
-    RemoveTexture(im_texture);
-    im_texture = nullptr;
-
-    v.device.destroyImageView(image_view, v.allocator);
-    image_view = VK_NULL_HANDLE;
-    v.device.destroyImage(image, v.allocator);
-    image = VK_NULL_HANDLE;
-    v.device.freeMemory(image_memory, v.allocator);
-    image_memory = VK_NULL_HANDLE;
+    if (upload_buffer) {
+        v.device.destroyBuffer(upload_buffer, v.allocator);
+        upload_buffer = VK_NULL_HANDLE;
+    }
+    if (upload_buffer_memory) {
+        v.device.freeMemory(upload_buffer_memory, v.allocator);
+        upload_buffer_memory = VK_NULL_HANDLE;
+    }
+    if (command_buffer) {
+        std::unique_lock lk(bd->command_pool_mutex);
+        v.device.freeCommandBuffers(bd->command_pool, {command_buffer});
+        command_buffer = VK_NULL_HANDLE;
+    }
+    if (im_texture != nullptr) {
+        RemoveTexture(im_texture);
+        im_texture = nullptr;
+    }
+    if (image_view) {
+        v.device.destroyImageView(image_view, v.allocator);
+        image_view = VK_NULL_HANDLE;
+    }
+    if (image) {
+        v.device.destroyImage(image, v.allocator);
+        image = VK_NULL_HANDLE;
+    }
+    if (image_memory) {
+        v.device.freeMemory(image_memory, v.allocator);
+        image_memory = VK_NULL_HANDLE;
+    }
 }
 
 // Register a texture

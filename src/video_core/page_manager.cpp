@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/config.h"
@@ -12,6 +14,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+#include "video_core/page_watcher_counter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -47,13 +50,10 @@ struct PageManager::Impl {
         u8 num_write_watchers{};
         u8 num_read_watchers{};
 
-        bool IsFastPathGame() const noexcept {
-            const auto& serial = MemoryPatcher::g_game_serial;
-            return (serial == "CUSA03173" || serial == "CUSA00900" || serial == "CUSA00208" ||
-                    serial == "CUSA01363" || serial == "CUSA01322" || serial == "CUSA003027" ||
-                    serial == "CUSA00299" || serial == "CUSA00207" || serial == "CUSA03014" ||
-                    serial == "CUSA03023" || serial == "CUSA50617" || serial == "CUSA18723" ||
-                    serial == "CUSA28863");
+        // Evaluated once per process; this accessor runs several times for every 4 KiB page a
+        // watcher update touches, so it must not compare strings.
+        static bool IsFastPathGame() noexcept {
+            return MemoryPatcher::Quirks().fast_path_page_watchers;
         }
 
         Core::MemoryPermission WritePerm() const noexcept {
@@ -74,46 +74,65 @@ struct PageManager::Impl {
         Core::MemoryPermission Perms() const noexcept {
             return ReadPerm() | WritePerm();
         }
-
-        template <s32 delta, bool is_read = false>
-        u8 AddDelta() {
-            if (IsFastPathGame()) {
-                if constexpr (delta == 1) {
-                    return ++num_watchers;
-                } else if constexpr (delta == -1) {
-                    ASSERT_MSG(num_watchers > 0, "Not enough watchers");
-                    return --num_watchers;
-                } else {
-                    return num_watchers;
-                }
-            } else {
-                if constexpr (is_read) {
-                    if constexpr (delta == 1) {
-                        return ++num_read_watchers;
-                    } else if constexpr (delta == -1) {
-                        ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
-                        return --num_read_watchers;
-                    } else {
-                        return num_read_watchers;
-                    }
-                } else {
-                    if constexpr (delta == 1) {
-                        return ++num_write_watchers;
-                    } else if constexpr (delta == -1) {
-                        ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
-                        return --num_write_watchers;
-                    } else {
-                        return num_write_watchers;
-                    }
-                }
-            }
-        }
     };
+    static_assert(sizeof(PageState) == 3,
+                  "PageState is replicated across the 40-bit address space");
 
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
+
+    template <bool is_read>
+    static u8& SelectCounter(PageState& state) noexcept {
+        if (state.IsFastPathGame()) {
+            return state.num_watchers;
+        }
+        if constexpr (is_read) {
+            return state.num_read_watchers;
+        }
+        return state.num_write_watchers;
+    }
+
+    template <bool is_read>
+    static constexpr u32 CounterKey(size_t page, bool fast_path) noexcept {
+        const u32 kind = fast_path ? 0u : (is_read ? 2u : 1u);
+        return static_cast<u32>(page * 3 + kind);
+    }
+
+    template <s32 delta, bool is_read>
+    u32 AddPageWatcherDelta(PageState& state, size_t page) {
+        u8& counter = SelectCounter<is_read>(state);
+        if constexpr (delta == 1) {
+            const u32 key = CounterKey<is_read>(page, state.IsFastPathGame());
+            return watcher_overflow.Increment(key, counter);
+        } else {
+            static_assert(delta == -1);
+            const u32 key = CounterKey<is_read>(page, state.IsFastPathGame());
+            return watcher_overflow.Decrement(key, counter);
+        }
+    }
+
+    PageManager::WatcherState GetWatcherState(VAddr address) {
+        const size_t page = address >> PAGE_BITS;
+        if (page >= NUM_ADDRESS_PAGES) {
+            return {};
+        }
+
+        std::scoped_lock lock{locks[page / PAGES_PER_LOCK]};
+        const PageState& state = cached_pages[page];
+        PageManager::WatcherState result{.fast_path = state.IsFastPathGame()};
+        if (result.fast_path) {
+            result.aggregate =
+                watcher_overflow.Value(CounterKey<false>(page, true), state.num_watchers);
+        } else {
+            result.write =
+                watcher_overflow.Value(CounterKey<false>(page, false), state.num_write_watchers);
+            result.read =
+                watcher_overflow.Value(CounterKey<true>(page, false), state.num_read_watchers);
+        }
+        return result;
+    }
 
 #ifdef ENABLE_USERFAULTFD
     Impl(Vulkan::Rasterizer* rasterizer_) {
@@ -180,9 +199,20 @@ struct PageManager::Impl {
 #else
     Impl(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
+#ifdef _WIN64
+        active = this;
+#endif
         constexpr auto priority = std::numeric_limits<u32>::min();
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
+    }
+
+    ~Impl() {
+#ifdef _WIN64
+        if (active == this) {
+            active = nullptr;
+        }
+#endif
     }
 
     void OnMap(VAddr address, size_t size) {}
@@ -197,14 +227,151 @@ struct PageManager::Impl {
         impl.Protect(address, size, perms);
     }
 
-    static bool GuestFaultSignalHandler(void* context, void* fault_address) {
-        const auto addr = reinterpret_cast<VAddr>(fault_address);
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
-        } else {
-            return rasterizer->ReadMemory(addr, 8);
+#ifdef _WIN64
+    struct FaultPageStatus {
+        PageState state{};
+        PageManager::WatcherState watchers{};
+        DWORD protection{};
+        bool trackable_protection{};
+        bool writable{};
+        bool repaired{};
+    };
+
+    static bool IsWritableProtection(DWORD protection) noexcept {
+        if ((protection & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+        switch (protection & 0xff) {
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
         }
     }
+
+    FaultPageStatus CheckAndRepairWriteFault(VAddr address) {
+        const size_t page = address >> PAGE_BITS;
+        FaultPageStatus status;
+
+        MEMORY_BASIC_INFORMATION memory_info{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &memory_info, sizeof(memory_info)) ==
+                0 ||
+            memory_info.State != MEM_COMMIT) {
+            return status;
+        }
+        status.protection = memory_info.Protect;
+        status.writable = IsWritableProtection(status.protection);
+        const DWORD base_protection = status.protection & 0xff;
+        status.trackable_protection =
+            (status.protection & PAGE_GUARD) == 0 &&
+            (base_protection == PAGE_READONLY || base_protection == PAGE_NOACCESS);
+        if (status.writable || page >= NUM_ADDRESS_PAGES) {
+            return status;
+        }
+
+        std::scoped_lock lock{locks[page / PAGES_PER_LOCK]};
+        status.state = cached_pages[page];
+        status.watchers.fast_path = status.state.IsFastPathGame();
+        if (status.watchers.fast_path) {
+            status.watchers.aggregate =
+                watcher_overflow.Value(CounterKey<false>(page, true), status.state.num_watchers);
+        } else {
+            status.watchers.write = watcher_overflow.Value(CounterKey<false>(page, false),
+                                                           status.state.num_write_watchers);
+            status.watchers.read = watcher_overflow.Value(CounterKey<true>(page, false),
+                                                          status.state.num_read_watchers);
+        }
+
+        // If bookkeeping already says that no write watcher remains, an earlier protection
+        // transition was lost. Reapply the permission represented by the authoritative state. Do
+        // not override a real remaining watcher: that would trade the hang for stale GPU data.
+        if (status.trackable_protection &&
+            True(status.state.Perms() & Core::MemoryPermission::Write)) {
+            Protect(page << PAGE_BITS, PAGE_SIZE, status.state.Perms());
+            status.repaired = true;
+            status.writable = true;
+        }
+        return status;
+    }
+#endif
+
+    static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        const auto addr = reinterpret_cast<VAddr>(fault_address);
+        const bool is_write = Common::IsWriteError(context);
+
+#ifdef _WIN64
+        struct FaultRetryState {
+            void* instruction{};
+            VAddr address{};
+            u32 unresolved_retries{};
+        };
+        thread_local FaultRetryState retry;
+        void* const instruction = is_write ? Common::GetRip(context) : nullptr;
+        const bool repeated_fault =
+            is_write && retry.instruction == instruction && retry.address == addr;
+        bool diagnose_repeated_fault = false;
+        if (repeated_fault && retry.unresolved_retries == 0) {
+            // Full cache-owner snapshots are intentionally expensive and, with synchronous
+            // logging, can turn fault contention into HDD stalls. Preserve representative samples
+            // without emitting thousands of near-identical production log lines.
+            static std::atomic<u64> diagnostic_count{};
+            const u64 sample = diagnostic_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            diagnose_repeated_fault = sample <= 8 || (sample & (sample - 1)) == 0;
+        }
+        const bool handled = is_write
+                                 ? rasterizer->InvalidateMemory(addr, 8, diagnose_repeated_fault)
+                                 : rasterizer->ReadMemory(addr, 8);
+#else
+        const bool handled =
+            is_write ? rasterizer->InvalidateMemory(addr, 8) : rasterizer->ReadMemory(addr, 8);
+#endif
+
+#ifdef _WIN64
+        if (!handled || !is_write || active == nullptr) {
+            retry = {};
+            return handled;
+        }
+
+        if (!repeated_fault) {
+            retry = {.instruction = instruction, .address = addr};
+            return true;
+        }
+
+        const FaultPageStatus status = active->CheckAndRepairWriteFault(addr);
+        if (status.writable) {
+            if (status.repaired) {
+                LOG_WARNING(Render_Vulkan,
+                            "Repaired stale guest-page protection at address {} (instruction {})",
+                            fmt::ptr(fault_address), fmt::ptr(instruction));
+            }
+            retry = {};
+            return true;
+        }
+
+        if (retry.unresolved_retries != std::numeric_limits<u32>::max()) {
+            ++retry.unresolved_retries;
+        }
+        const u32 repeats = retry.unresolved_retries;
+        if (repeats == 1 || (repeats & (repeats - 1)) == 0) {
+            LOG_ERROR(Render_Vulkan,
+                      "Guest write fault made no progress: address={}, instruction={}, "
+                      "repeats={}, protection={:#x}, watchers={} (write={}, read={}, fast_path={})",
+                      fmt::ptr(fault_address), fmt::ptr(instruction), repeats, status.protection,
+                      status.watchers.aggregate, status.watchers.write, status.watchers.read,
+                      status.watchers.fast_path);
+        }
+        return true;
+#else
+        return handled;
+#endif
+    }
+
+#ifdef _WIN64
+    inline static Impl* active{};
+#endif
 #endif
 
     template <bool track, bool is_read>
@@ -235,7 +402,7 @@ struct PageManager::Impl {
 
         for (; page != page_end; ++page) {
             PageState& state = cached_pages[page];
-            const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
+            const u32 new_count = AddPageWatcherDelta<track ? 1 : -1, is_read>(state, page);
             const auto new_perms = state.Perms();
 
             if (new_perms != perms) [[unlikely]] {
@@ -270,6 +437,7 @@ struct PageManager::Impl {
     }
 
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
+    PageWatcherCounterOverflow watcher_overflow;
 #ifdef __linux__
     using LockType = Common::AdaptiveMutex;
 #else
@@ -286,6 +454,9 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 }
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+PageManager::WatcherState PageManager::GetWatcherState(VAddr address) const {
+    return impl->GetWatcherState(address);
 }
 
 template <bool track>

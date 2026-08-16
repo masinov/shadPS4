@@ -4,6 +4,7 @@
 #include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/fault_manager_policy.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -157,15 +158,35 @@ void FaultManager::ProcessFaultBuffer() {
     scheduler.DeferOperation([this, mapped, area = current_area] {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-        const u32 fault_count = fault_buf[0];
+        const u32 reported_fault_count = static_cast<u32>(fault_buf[0]);
+        const u32 fault_count = RetainedFaultCount(reported_fault_count, MaxPageFaults);
+        if (reported_fault_count > fault_count) {
+            // The parser's atomic counter continues increasing after its bounded output array is
+            // full. Never trust that counter as a CPU-side array bound.
+            LOG_WARNING(Render_Vulkan,
+                        "Direct-memory fault batch truncated: reported={}, retained={}",
+                        reported_fault_count, fault_count);
+        }
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], caching_pagesize);
-            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
+            const auto state = buffer_cache.GetDebugPageState(fault_buf[i]);
+            LOG_INFO(Render_Vulkan,
+                     "Accessed non-GPU cached memory at {:#x}: registered={}, cache_id={}, "
+                     "cache=[{:#x},{:#x}), tracker={}, cpu_modified={}, gpu_modified={}, "
+                     "gpu_pending={}",
+                     fault_buf[i], state.registered, state.buffer_id, state.buffer_begin,
+                     state.buffer_end, state.tracker_exists, state.cpu_modified, state.gpu_modified,
+                     state.gpu_pending);
         }
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
             buffer_cache.FindBuffer(start, static_cast<u32>(end - start));
+            // Materializing the BDA page is not enough: a newly created cache allocation has no
+            // guest contents until synchronization records its upload. Do that in the same
+            // recovery callback so the next submission cannot observe an initialized page table
+            // pointing at uninitialized storage.
+            buffer_cache.SynchronizeBuffersInRange(start, end - start);
         });
         fault_areas[area] = 0;
     });

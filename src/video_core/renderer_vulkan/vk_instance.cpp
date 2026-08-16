@@ -21,6 +21,36 @@ namespace Vulkan {
 
 namespace {
 
+constexpr std::string_view CheckpointName(GpuCheckpoint checkpoint) {
+    switch (checkpoint) {
+    case GpuCheckpoint::CommandBufferBegin:
+        return "command-buffer-begin";
+    case GpuCheckpoint::CommandBufferEnd:
+        return "command-buffer-end";
+    case GpuCheckpoint::DirectDraw:
+        return "direct-draw";
+    case GpuCheckpoint::IndirectDraw:
+        return "indirect-draw";
+    case GpuCheckpoint::DirectDispatch:
+        return "direct-dispatch";
+    case GpuCheckpoint::IndirectDispatch:
+        return "indirect-dispatch";
+    case GpuCheckpoint::PredicationReduce:
+        return "predication-reduce";
+    case GpuCheckpoint::BufferUpload:
+        return "buffer-upload";
+    case GpuCheckpoint::BufferDownload:
+        return "buffer-download";
+    case GpuCheckpoint::BufferCopy:
+        return "buffer-copy";
+    case GpuCheckpoint::BufferMerge:
+        return "buffer-merge";
+    case GpuCheckpoint::Count:
+        break;
+    }
+    return "unknown";
+}
+
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
     ASSERT_MSG(devices_result == vk::Result::eSuccess, "Failed to enumerate physical devices: {}",
@@ -96,12 +126,9 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic, bool ma
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index, bool enable_validation,
                    bool enable_crash_diagnostic, bool manage_imgui)
-    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
-                              enable_crash_diagnostic)},
+    : instance{
+          CreateInstance(window.GetWindowInfo().type, enable_validation, enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)}, manage_imgui{manage_imgui} {
-    if (enable_validation) {
-        debug_callback = CreateDebugCallback(*instance);
-    }
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
@@ -155,6 +182,14 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index, bool 
     }
 
     available_extensions = GetSupportedExtensions(physical_device);
+    const bool can_report_address_bindings =
+        std::ranges::find(available_extensions,
+                          VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) !=
+        available_extensions.end();
+    if (enable_validation || can_report_address_bindings) {
+        debug_callback =
+            CreateDebugCallback(*instance, &device_address_tracker, can_report_address_bindings);
+    }
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
@@ -177,6 +212,207 @@ Instance::~Instance() {
     vmaDestroyAllocator(allocator);
 }
 
+void Instance::InsertCheckpoint(vk::CommandBuffer cmdbuf, GpuCheckpoint checkpoint,
+                                const GpuCheckpointContext& context) const {
+    if (diagnostic_checkpoints) {
+        cmdbuf.setCheckpointNV(checkpoint_tracker.Record(checkpoint, context));
+    }
+}
+
+void Instance::ReportDeviceLoss(std::string_view operation) const {
+    if (device_fault_reported.test_and_set(std::memory_order_relaxed)) {
+        return;
+    }
+
+    LOG_CRITICAL(Render_Vulkan, "Vulkan device lost during {}.", operation);
+    if (diagnostic_checkpoints) {
+        const auto checkpoints = graphics_queue.getCheckpointDataNV();
+        if (checkpoints.empty()) {
+            LOG_CRITICAL(Render_Vulkan, "NVIDIA diagnostic checkpoints returned no records.");
+        }
+        for (size_t i = 0; i < checkpoints.size(); ++i) {
+            const auto& checkpoint = checkpoints[i];
+            const auto record = checkpoint_tracker.Resolve(checkpoint.pCheckpointMarker);
+            if (!record) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "NVIDIA checkpoint #{}: stage={}, marker pointer={} is unknown or "
+                             "older than the retained history",
+                             i, vk::to_string(checkpoint.stage), checkpoint.pCheckpointMarker);
+                continue;
+            }
+            const auto& context = record->context;
+            // Indirect draws/dispatches read their parameters from a GPU argument buffer; the
+            // CPU-side context only knows where those arguments live, not their values.
+            const std::string instances = context.indirect_arguments
+                                              ? "gpu-argument-buffer"
+                                              : fmt::format("{}", context.instance_count);
+            const std::string_view items_label =
+                context.indirect_arguments ? "max_draw_commands" : "items";
+            const std::string_view transfer_label =
+                context.indirect_arguments ? "arguments" : "transfer";
+            LOG_CRITICAL(Render_Vulkan,
+                         "NVIDIA checkpoint #{}: stage={}, serial={}, marker='{}', pipeline={:#x}, "
+                         "{}={}, instances={}, groups={}x{}x{}, indexed={}, predicated={}, "
+                         "uses_dma={}, color_attachments={}, depth_attachment={}, "
+                         "stencil_attachment={}, writable_buffers={}, writable_images={}, "
+                         "shader_hashes={}, {}=[{:#x}->{:#x}, size={:#x}, generations={}->{}, "
+                         "source_offset={:#x}], pointer={}",
+                         i, vk::to_string(checkpoint.stage), record->serial,
+                         CheckpointName(record->checkpoint), context.pipeline_hash, items_label,
+                         context.item_count, instances, context.group_x, context.group_y,
+                         context.group_z, context.indexed, context.predicated, context.uses_dma,
+                         context.color_attachment_count, context.has_depth_attachment,
+                         context.has_stencil_attachment, context.writable_buffer_count,
+                         context.writable_image_count, context.shader_hashes, transfer_label,
+                         context.source_guest_address, context.destination_guest_address,
+                         context.transfer_size, context.source_generation,
+                         context.destination_generation, context.source_offset,
+                         checkpoint.pCheckpointMarker);
+            const size_t buffer_count =
+                std::min<size_t>(context.writable_buffer_count, context.writable_buffers.size());
+            for (size_t resource = 0; resource < buffer_count; ++resource) {
+                const auto& buffer = context.writable_buffers[resource];
+                LOG_CRITICAL(Render_Vulkan,
+                             "NVIDIA checkpoint #{} writable buffer #{}: guest={:#x}, size={:#x}, "
+                             "cache_id={}",
+                             i, resource, buffer.guest_address, buffer.size, buffer.id);
+            }
+            const size_t image_count =
+                std::min<size_t>(context.writable_image_count, context.writable_images.size());
+            for (size_t resource = 0; resource < image_count; ++resource) {
+                const auto& image = context.writable_images[resource];
+                LOG_CRITICAL(Render_Vulkan,
+                             "NVIDIA checkpoint #{} writable image #{}: guest={:#x}, size={:#x}, "
+                             "cache_id={}",
+                             i, resource, image.guest_address, image.size, image.id);
+            }
+        }
+    }
+    if (!device_fault) {
+        LOG_CRITICAL(Render_Vulkan, "{} diagnostics were unavailable on this device.",
+                     VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        return;
+    }
+
+    vk::DeviceFaultCountsEXT counts{};
+    const vk::Result count_result = device->getFaultInfoEXT(&counts, nullptr);
+    if (count_result != vk::Result::eSuccess && count_result != vk::Result::eIncomplete) {
+        LOG_CRITICAL(Render_Vulkan, "Failed to query device-fault counts: {}",
+                     vk::to_string(count_result));
+        return;
+    }
+
+    // Fault reporting runs in an already-failing, potentially memory-starved process. Bound the
+    // diagnostic allocation while still retaining far more records than a normal driver emits.
+    static constexpr u32 MaxFaultRecords = 256;
+    const u32 reported_address_count = counts.addressInfoCount;
+    const u32 reported_vendor_count = counts.vendorInfoCount;
+    counts.addressInfoCount = std::min(counts.addressInfoCount, MaxFaultRecords);
+    counts.vendorInfoCount = std::min(counts.vendorInfoCount, MaxFaultRecords);
+    counts.vendorBinarySize = 0;
+
+    std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<vk::DeviceFaultVendorInfoEXT> vendor_infos(counts.vendorInfoCount);
+    vk::DeviceFaultInfoEXT fault_info{
+        .pAddressInfos = addresses.data(),
+        .pVendorInfos = vendor_infos.data(),
+        .pVendorBinaryData = nullptr,
+    };
+    const vk::Result info_result = device->getFaultInfoEXT(&counts, &fault_info);
+    if (info_result != vk::Result::eSuccess && info_result != vk::Result::eIncomplete) {
+        LOG_CRITICAL(Render_Vulkan, "Failed to query device-fault details: {}",
+                     vk::to_string(info_result));
+        return;
+    }
+
+    const auto bounded_text = [](const auto& text) {
+        const auto end = std::find(text.begin(), text.end(), '\0');
+        return std::string_view{text.data(), static_cast<size_t>(end - text.begin())};
+    };
+    LOG_CRITICAL(Render_Vulkan,
+                 "Device fault: description='{}', addresses={}/{}, vendor_records={}/{}, "
+                 "result={}",
+                 bounded_text(fault_info.description),
+                 std::min<size_t>(counts.addressInfoCount, addresses.size()),
+                 reported_address_count,
+                 std::min<size_t>(counts.vendorInfoCount, vendor_infos.size()),
+                 reported_vendor_count, vk::to_string(info_result));
+
+    const size_t address_count = std::min<size_t>(counts.addressInfoCount, addresses.size());
+    for (size_t i = 0; i < address_count; ++i) {
+        const auto& address = addresses[i];
+        LOG_CRITICAL(Render_Vulkan,
+                     "Device fault address #{}: type={}, address={:#x}, precision={} bytes", i,
+                     vk::to_string(address.addressType), address.reportedAddress,
+                     address.addressPrecision);
+        // Instruction-pointer records locate shader code, not data memory. Correlating them with
+        // buffer or memory-binding ranges produces meaningless "nearest allocation" output.
+        if (address.addressType == vk::DeviceFaultAddressTypeEXT::eInstructionPointerUnknown ||
+            address.addressType == vk::DeviceFaultAddressTypeEXT::eInstructionPointerInvalid ||
+            address.addressType == vk::DeviceFaultAddressTypeEXT::eInstructionPointerFault) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Device fault address #{} is a shader instruction pointer; data-binding "
+                         "correlation skipped.",
+                         i);
+            continue;
+        }
+        if (device_address_binding_report) {
+            const auto matches = device_address_tracker.FindAll(address.reportedAddress);
+            if (!matches.empty()) {
+                for (size_t match_index = 0; match_index < matches.size(); ++match_index) {
+                    const auto& match = matches[match_index];
+                    LOG_CRITICAL(
+                        Render_Vulkan,
+                        "Device fault address #{} binding match #{}: state={}, relation={}, "
+                        "base={:#x}, size={:#x}, distance={:#x}, internal={}, sequence={}, "
+                        "live_bindings={}, dropped={}",
+                        i, match_index,
+                        match.state == AddressBindingState::Live ? "live" : "recently-unbound",
+                        match.contains ? "contains" : "nearest", match.base, match.size,
+                        match.distance, match.internal, match.sequence,
+                        device_address_tracker.LiveCount(), device_address_tracker.DroppedCount());
+                }
+            } else {
+                LOG_CRITICAL(Render_Vulkan,
+                             "Device fault address #{} had no retained address-binding match.", i);
+            }
+        }
+        const auto buffer_matches = buffer_address_tracker.FindAll(address.reportedAddress);
+        if (buffer_matches.empty()) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Device fault address #{} had no retained buffer-address match; "
+                         "live_records={}, missing_retirements={}",
+                         i, buffer_address_tracker.LiveCount(),
+                         buffer_address_tracker.MissingRetirementCount());
+        }
+        for (size_t match_index = 0; match_index < buffer_matches.size(); ++match_index) {
+            const auto& match = buffer_matches[match_index];
+            LOG_CRITICAL(
+                Render_Vulkan,
+                "Device fault address #{} buffer match #{}: state={}, relation={}, generation={}, "
+                "device_base={:#x}, size={:#x}, guest_base={:#x}, guest_offset={:#x}, "
+                "allocation_size={:#x}, usage={}, distance={:#x}, retired_at={}, "
+                "last_use_tick={}, retirement_cpu_tick={}, retirement_scheduled_tick={}, "
+                "retirement_reason={}, live_records={}, missing_retirements={}",
+                i, match_index, match.state == BufferAddressState::Live ? "live" : "retired",
+                match.contains ? "contains" : "nearest", match.generation, match.device_address,
+                match.size, match.guest_address,
+                match.contains ? address.reportedAddress - match.device_address : 0,
+                match.allocation_size, match.usage, match.distance, match.retirement_sequence,
+                match.last_use_tick, match.retirement_cpu_tick, match.retirement_scheduled_tick,
+                match.retirement_reason, buffer_address_tracker.LiveCount(),
+                buffer_address_tracker.MissingRetirementCount());
+        }
+    }
+    const size_t vendor_count = std::min<size_t>(counts.vendorInfoCount, vendor_infos.size());
+    for (size_t i = 0; i < vendor_count; ++i) {
+        const auto& vendor = vendor_infos[i];
+        LOG_CRITICAL(
+            Render_Vulkan, "Device fault vendor #{}: description='{}', code={:#x}, data={:#x}", i,
+            bounded_text(vendor.description), vendor.vendorFaultCode, vendor.vendorFaultData);
+    }
+}
+
 std::string Instance::GetDriverVersionName() {
     // Extracted from
     // https://github.com/SaschaWillems/vulkan.gpuinfo.org/blob/5dddea46ea1120b0df14eef8f15ff8e318e35462/functions.php#L308-L314
@@ -197,18 +433,18 @@ std::string Instance::GetDriverVersionName() {
 }
 
 bool Instance::CreateDevice() {
-    const vk::StructureChain feature_chain =
-        physical_device
-            .getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
-                          vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
-                          vk::PhysicalDeviceRobustness2FeaturesEXT,
-                          vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
-                          vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
-                          vk::PhysicalDevicePortabilitySubsetFeaturesKHR,
-                          vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
-                          vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-                          vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT,
-                          vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
+    const vk::StructureChain feature_chain = physical_device.getFeatures2<
+        vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+        vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
+        vk::PhysicalDeviceRobustness2FeaturesEXT,
+        vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
+        vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
+        vk::PhysicalDevicePortabilitySubsetFeaturesKHR,
+        vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
+        vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT,
+        vk::PhysicalDeviceConditionalRenderingFeaturesEXT, vk::PhysicalDeviceFaultFeaturesEXT,
+        vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -226,7 +462,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -349,6 +585,27 @@ bool Instance::CreateDevice() {
                  conditional_rendering_features.conditionalRendering);
     }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    device_fault_features = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (device_fault && !device_fault_features.deviceFault) {
+        LOG_WARNING(Render_Vulkan,
+                    "Extension {} is present but its deviceFault feature is unavailable.",
+                    VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        enabled_extensions.pop_back();
+        device_fault = false;
+    }
+    const auto address_binding_features =
+        feature_chain.get<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
+    device_address_binding_report =
+        add_extension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (device_address_binding_report && !address_binding_features.reportAddressBinding) {
+        LOG_WARNING(Render_Vulkan,
+                    "Extension {} is present but its reportAddressBinding feature is unavailable.",
+                    VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        enabled_extensions.pop_back();
+        device_address_binding_report = false;
+    }
+    diagnostic_checkpoints = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -361,8 +618,6 @@ bool Instance::CreateDevice() {
         }
     }
 #endif
-
-    supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -384,10 +639,23 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // vkQueuePresentKHR can block for the whole presentation backlog (Run 21: 1.87 s). Sharing
+    // one VkQueue with graphics forces every scheduler submission to wait behind that block under
+    // the queue mutex. Presenting on a second queue of the family removes that coupling, but the
+    // one session that ran with it (Run 22) died within two minutes with a WriteInvalid at GPU
+    // address 0 and NVIDIA returned no checkpoint records for the graphics queue, so the
+    // dedicated queue stays disabled until that interaction is understood.
+    static constexpr bool EnableDedicatedPresentQueue = false;
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const u32 requested_queue_count =
+        EnableDedicatedPresentQueue
+            ? std::min<u32>(static_cast<u32>(queue_priorities.size()),
+                            family_properties[queue_family_index].queueCount)
+            : 1u;
+    dedicated_present_queue = requested_queue_count > 1;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = requested_queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -531,6 +799,13 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceConditionalRenderingFeaturesEXT{
             .conditionalRendering = true,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+            .deviceFaultVendorBinary = false,
+        },
+        vk::PhysicalDeviceAddressBindingReportFeaturesEXT{
+            .reportAddressBinding = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -579,6 +854,12 @@ bool Instance::CreateDevice() {
     if (!conditional_rendering) {
         device_chain.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
     }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!device_address_binding_report) {
+        device_chain.unlink<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -590,7 +871,10 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    present_queue = device->getQueue(queue_family_index, 0);
+    present_queue = device->getQueue(queue_family_index, dedicated_present_queue ? 1 : 0);
+    LOG_INFO(Render_Vulkan, "Presentation queue: {} (family {} exposes {} queues)",
+             dedicated_present_queue ? "dedicated" : "shared with graphics", queue_family_index,
+             family_properties[queue_family_index].queueCount);
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -633,8 +917,11 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    const VmaAllocatorCreateFlags allocator_flags =
+        VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+        (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = allocator_flags,
         .physicalDevice = physical_device,
         .device = *device,
         .pVulkanFunctions = &functions,
@@ -774,6 +1061,17 @@ void Instance::CollectToolingInfo() const {
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {
+    if (!supports_memory_budget) {
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+
+        u64 total_usage = 0;
+        for (const size_t heap : valid_heaps) {
+            total_usage += heap_budgets[heap].usage;
+        }
+        return total_usage;
+    }
+
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
     vk::PhysicalDeviceMemoryProperties2 props = {
         .pNext = &memory_budget_props,
@@ -785,8 +1083,11 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
 
-    const u64 ps4_vram_limit = 4_GB;
-    return std::min(total_usage, ps4_vram_limit);
+    return total_usage;
+}
+
+void Instance::SetMemoryAllocatorFrameIndex(u32 frame_index) const {
+    vmaSetCurrentFrameIndex(allocator, frame_index);
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

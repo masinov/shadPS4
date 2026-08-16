@@ -129,7 +129,8 @@ public:
              FileShareFlag flag = FileShareFlag::ShareReadOnly);
     void Close();
 
-    void Unlink();
+    /// Marks the open file for deletion. Returns zero on success or a host errno value.
+    int Unlink();
 
     bool Flush() const;
     bool Commit() const;

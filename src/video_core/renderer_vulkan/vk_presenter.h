@@ -33,6 +33,7 @@ struct Frame {
     vk::Fence present_done;
     vk::Semaphore ready_semaphore;
     u64 ready_tick;
+    u64 present_tick;
     bool is_hdr{false};
     u8 id{};
 
@@ -103,6 +104,8 @@ public:
 
 private:
     Frame* GetRenderFrame();
+
+    void WaitForPresentFence(Frame* frame);
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 

@@ -3,9 +3,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 
+#include "video_core/renderer_vulkan/device_address_tracker.h"
+#include "video_core/renderer_vulkan/gpu_diagnostic_tracker.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -50,6 +54,38 @@ public:
         return *device;
     }
 
+    /// Logs the first available VK_EXT_device_fault report after a device-lost result.
+    void ReportDeviceLoss(std::string_view operation) const;
+
+    [[nodiscard]] bool HasDeviceLoss() const {
+        return device_fault_reported.test(std::memory_order_relaxed);
+    }
+
+    /// Inserts a uniquely identifiable NVIDIA diagnostic marker when supported.
+    void InsertCheckpoint(vk::CommandBuffer cmdbuf, GpuCheckpoint checkpoint,
+                          const GpuCheckpointContext& context = {}) const;
+
+    /// Returns true when NVIDIA diagnostic checkpoints are recorded. Callers can skip building
+    /// per-draw checkpoint context entirely when this is false.
+    [[nodiscard]] bool HasDiagnosticCheckpoints() const noexcept {
+        return diagnostic_checkpoints;
+    }
+
+    [[nodiscard]] u64 TrackBufferAddress(u64 device_address, u64 size, u64 guest_address,
+                                         u64 allocation_size, u32 usage) const {
+        if (!device_fault && !diagnostic_checkpoints) {
+            return 0;
+        }
+        return buffer_address_tracker.Register(device_address, size, guest_address, allocation_size,
+                                               usage);
+    }
+
+    void RetireBufferAddress(u64 generation, u64 last_use_tick, u64 retirement_cpu_tick,
+                             u64 retirement_scheduled_tick, u32 retirement_reason) const {
+        buffer_address_tracker.Retire(generation, last_use_tick, retirement_cpu_tick,
+                                      retirement_scheduled_tick, retirement_reason);
+    }
+
     /// Returns the VMA allocator handle
     VmaAllocator GetAllocator() const {
         return allocator;
@@ -75,6 +111,12 @@ public:
 
     vk::Queue GetPresentQueue() const {
         return present_queue;
+    }
+
+    /// True when presentation uses its own VkQueue and therefore does not need the graphics
+    /// queue's external synchronization (Scheduler::submit_mutex).
+    bool HasDedicatedPresentQueue() const noexcept {
+        return dedicated_present_queue;
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -459,9 +501,12 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
+    /// Advances VMA's frame index so cached heap budgets are refreshed periodically.
+    void SetMemoryAllocatorFrameIndex(u32 frame_index) const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
-        return 4_GB; // PS4 VRAM limit for testing
+        return total_memory_budget;
     }
 
     /// Determines if a format is supported for a set of feature flags.
@@ -503,11 +548,14 @@ private:
         workgroup_memory_explicit_layout_features;
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
+    vk::PhysicalDeviceFaultFeaturesEXT device_fault_features;
     vk::DriverIdKHR driver_id;
+    DeviceAddressTracker device_address_tracker;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    bool dedicated_present_queue{};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
@@ -541,7 +589,13 @@ private:
     bool conditional_rendering{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool device_fault{};
+    bool device_address_binding_report{};
+    bool diagnostic_checkpoints{};
     bool manage_imgui{true};
+    mutable GpuCheckpointTracker checkpoint_tracker;
+    mutable BufferAddressTracker buffer_address_tracker;
+    mutable std::atomic_flag device_fault_reported = ATOMIC_FLAG_INIT;
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

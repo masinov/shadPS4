@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <limits>
+#include <vector>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -27,30 +32,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, page_manager{page_manager_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
-      readback_linear_images{Config::getReadbackLinearImages()} {
-
-    // Set up garbage collection parameters.
-    if (!instance.CanReportMemoryUsage()) {
-        trigger_gc_memory = 0;
-        pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
-        critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
-        return;
-    }
-
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
-    trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
-}
+      readback_linear_images{Config::getReadbackLinearImages()} {}
 
 TextureCache::~TextureCache() = default;
 
@@ -174,6 +156,34 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, ImageId exclude_ima
             MarkAsMaybeDirty(image_id, image);
         }
     });
+}
+
+TextureCache::DebugPageState TextureCache::GetDebugPageState(VAddr addr) {
+    const VAddr page_begin = PageManager::GetPageAddr(addr);
+    const VAddr page_end = page_begin + PageManager::PAGE_SIZE;
+    DebugPageState result;
+
+    std::scoped_lock lock{mutex};
+    ForEachImageInRegion(page_begin, PageManager::PAGE_SIZE, [&](ImageId image_id, Image& image) {
+        ++result.registered_images;
+        if (image.IsTracked() && image.track_addr < page_end && page_begin < image.track_addr_end) {
+            if (result.tracked_images == 0) {
+                result.first_tracked_image = image_id.index;
+                result.image_begin = image.info.guest_address;
+                result.image_end = image.info.guest_address + image.info.guest_size;
+                result.track_begin = image.track_addr;
+                result.track_end = image.track_addr_end;
+            }
+            ++result.tracked_images;
+        }
+        if (True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+            ++result.cpu_dirty_images;
+        }
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            ++result.gpu_modified_images;
+        }
+    });
+    return result;
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
@@ -603,7 +613,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
-    image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
     // If the image requested is a subresource of the image from cache record its location.
@@ -653,6 +662,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         image.flags |= ImageFlagBits::GpuModified;
         if (!image.info.props.is_tiled && image.info.guest_address != 0 &&
             image.info.props.is_volume) {
+            std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
     }
@@ -830,7 +840,6 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
@@ -842,7 +851,6 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
     lru_cache.Free(image.lru_id);
-    total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -967,93 +975,114 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     page_manager.UpdatePageWatchers<false>(addr, size);
 }
 
-void TextureCache::RunGarbageCollector() {
-    SCOPE_EXIT {
-        ++gc_tick;
-    };
+void TextureCache::AdvanceGcEpoch() {
+    ++gc_tick;
+}
 
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
+    GcResult result;
+    if (!budget.Active()) {
+        return result;
     }
 
-    if (total_used_memory < trigger_gc_memory) {
-        return;
+    const u64 min_age = GcMinimumAge(budget.pressure);
+    if (gc_tick <= min_age) {
+        return result;
     }
+    const u64 cutoff = gc_tick - min_age;
+    const u32 inspection_multiplier = budget.pressure == GcPressure::Critical ? 8 : 4;
+    static constexpr u32 MaxGcInspections = 4096;
+    u32 inspections_remaining = budget.objects_remaining > MaxGcInspections / inspection_multiplier
+                                    ? MaxGcInspections
+                                    : budget.objects_remaining * inspection_multiplier;
 
     std::scoped_lock lock{mutex};
-    bool pressured = total_used_memory >= pressure_gc_memory;
-    bool aggressive = total_used_memory >= critical_gc_memory;
 
-    u64 ticks_to_destroy = std::min<u64>(aggressive ? 160 : pressured ? 80 : 16, gc_tick);
-    size_t num_deletions = aggressive ? 40 : pressured ? 20 : 10;
-    num_deletions = std::min(num_deletions, static_cast<size_t>(32));
+    struct Candidate {
+        ImageId id;
+        u64 size;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(inspections_remaining);
+    u64 candidate_bytes{};
 
-    const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0)
+    const auto collect = [&](ImageId image_id) {
+        if (inspections_remaining == 0 || (budget.pressure != GcPressure::Critical &&
+                                           candidate_bytes >= budget.bytes_remaining)) {
             return true;
+        }
+        --inspections_remaining;
+        ++result.inspected_objects;
 
-        --num_deletions;
         auto& image = slot_images[image_id];
-        const bool download = image.SafeToDownload();
-        const bool tiled = image.info.IsTiled();
-
-        if (tiled && download)
+        // Stencil-only guest ranges are deliberately represented by registered Image entries with
+        // an undefined format and no Vulkan backing. They participate in overlap resolution and
+        // depth association, but cannot contribute bytes toward a device-memory reclaim target.
+        if (image.info.pixel_format == vk::Format::eUndefined) {
+            ASSERT_MSG(image.AllocationSizeBytes() == 0,
+                       "Undefined-format image unexpectedly owns a physical allocation");
+            ++result.skipped_unallocated;
             return false;
+        }
 
-        if (download && !pressured)
+        if (image.binding.is_bound || image.binding.is_target) {
+            ++result.skipped_bound;
             return false;
+        }
 
-        if (download)
-            DownloadImageMemory(image_id);
+        if (IsResourceInFlight(image.tick_accessed_last, scheduler.CurrentTick())) {
+            ++result.skipped_in_flight;
+            return false;
+        }
+        if (budget.require_completed &&
+            !CanReclaimWithoutWait(image.tick_accessed_last, budget.completed_tick)) {
+            ++result.skipped_pending;
+            return false;
+        }
 
-        EnqueueForGc([this, image_id]() { FreeImage(image_id); });
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            ++result.skipped_gpu_modified;
+            return false;
+        }
+
+        const u64 size = image.AllocationSizeBytes();
+        ASSERT_MSG(size != 0, "Tracked image has no physical allocation");
+        candidates.push_back({image_id, size});
+        candidate_bytes += size;
         return false;
     };
 
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-
-    if (total_used_memory >= critical_gc_memory) {
-        lru_cache.ForEachItemBelow(gc_tick - (ticks_to_destroy / 2), clean_up);
+    lru_cache.ForEachItemBelow(cutoff, collect);
+    if (budget.pressure == GcPressure::Critical) {
+        std::stable_sort(
+            candidates.begin(), candidates.end(),
+            [](const Candidate& lhs, const Candidate& rhs) { return lhs.size > rhs.size; });
     }
 
-    // Only force VRAM flush in extreme cases to avoid FPS drops
-    if (aggressive && total_used_memory >= critical_gc_memory * 2) {
-        scheduler.Finish();
+    for (const Candidate& candidate : candidates) {
+        if (!budget.Active()) {
+            break;
+        }
+        FreeImage(candidate.id, budget.collect_retirements ? &result : nullptr);
+        budget.Reclaim(candidate.size);
+        result.reclaimed_bytes += candidate.size;
+        ++result.evicted_objects;
     }
-
-    RunGarbageCollectorAsync();
-}
-
-void TextureCache::EnqueueForGc(std::function<void()> fn) {
-    std::scoped_lock lock(gc_mutex);
-    gc_queue.push(std::move(fn));
-}
-
-void TextureCache::RunGarbageCollectorAsync() {
-    std::queue<std::function<void()>> local;
-    {
-        std::scoped_lock lock(gc_mutex);
-        std::swap(local, gc_queue);
-    }
-    while (!local.empty()) {
-        local.front()();
-        local.pop();
-    }
-
-    // Update memory usage after cleanup to ensure accurate tracking
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
-    }
+    return result;
 }
 
 void TextureCache::TouchImage(Image& image) {
+    image.tick_accessed_last = scheduler.CurrentTick();
     lru_cache.Touch(image.lru_id, gc_tick);
 
     // Image is still valid
     image.flags &= ~ImageFlagBits::MaybeReused;
 }
-void TextureCache::DeleteImage(ImageId image_id) {
+void TextureCache::DeleteImage(ImageId image_id, GcResult* gc_result) {
     Image& image = slot_images[image_id];
+    const u64 last_use_tick = image.tick_accessed_last;
+    const u64 allocation_size = image.AllocationSizeBytes();
+    const bool diagnose_retirement = gc_result != nullptr;
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 
@@ -1077,15 +1106,41 @@ void TextureCache::DeleteImage(ImageId image_id) {
     }
 
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
+    Common::UniqueFunction<void> retirement = [this, image_id, allocation_size, last_use_tick,
+                                               diagnose_retirement] {
+        const auto start = std::chrono::steady_clock::now();
         Image& image = slot_images[image_id];
+        u32 view_count{};
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {
                 slot_image_views.erase(image_view_id);
+                ++view_count;
             }
         }
+        const auto views_end = std::chrono::steady_clock::now();
         slot_images.erase(image_id);
-    });
+        const auto image_end = std::chrono::steady_clock::now();
+
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(image_end - start).count();
+        if (diagnose_retirement && total_us >= 10'000) {
+            const auto views_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(views_end - start).count();
+            const auto image_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(image_end - views_end)
+                    .count();
+            LOG_WARNING(Render_Vulkan,
+                        "Slow GC image retirement: id={}, allocation={} bytes, last_use_tick={}, "
+                        "views={}, view_destroy={} us, image_destroy={} us, total={} us",
+                        image_id.index, allocation_size, last_use_tick, view_count, views_us,
+                        image_us, total_us);
+        }
+    };
+    if (gc_result) {
+        gc_result->QueueRetirement(last_use_tick, std::move(retirement));
+    } else {
+        scheduler.DeferOperation(std::move(retirement));
+    }
 }
 
 } // namespace VideoCore

@@ -38,15 +38,15 @@ struct InitInfo {
 // Prepare all resources needed for uploading textures
 // Caller should clean up the returned data.
 struct UploadTextureData {
-    vk::Image image;
-    vk::ImageView image_view;
-    vk::DeviceMemory image_memory;
+    vk::Image image{};
+    vk::ImageView image_view{};
+    vk::DeviceMemory image_memory{};
 
-    vk::CommandBuffer command_buffer; // Submit to the queue
-    vk::Buffer upload_buffer;
-    vk::DeviceMemory upload_buffer_memory;
+    vk::CommandBuffer command_buffer{}; // Submit to the queue
+    vk::Buffer upload_buffer{};
+    vk::DeviceMemory upload_buffer_memory{};
 
-    ImTextureID im_texture;
+    ImTextureID im_texture{};
 
     void Upload();
 

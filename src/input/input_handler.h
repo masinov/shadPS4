@@ -453,30 +453,20 @@ public:
     static void GetGetGamepadIndexFromSDLJoystickID(const SDL_JoystickID id) {}
     static void LinkJoystickAxes();
 
-    u32 button;
-    u32 axis;
-    u8 gamepad_id;
+    u32 button{};
+    u32 axis{};
+    u8 gamepad_id{};
     // these are only used as s8,
     // but I added some padding to avoid overflow if it's activated by multiple inputs
-    // axis_plus and axis_minus pairs share a common new_param, the other outputs have their own
-    s16 old_param;
-    s16* new_param;
-    bool old_button_state, new_button_state, state_changed, positive_axis;
+    s16 old_param{};
+    s16 new_param{};
+    bool old_button_state{};
+    bool new_button_state{};
+    bool state_changed{};
+    bool positive_axis{};
 
-    ControllerOutput(const u32 b, u32 a = SDL_GAMEPAD_AXIS_INVALID, bool p = true) {
-        button = b;
-        axis = a;
-        new_param = new s16(0);
-        old_param = 0;
-        positive_axis = p;
-        gamepad_id = 0;
-    }
-    ControllerOutput(const ControllerOutput& o) : button(o.button), axis(o.axis) {
-        new_param = new s16(*o.new_param);
-    }
-    ~ControllerOutput() {
-        delete new_param;
-    }
+    ControllerOutput(const u32 b, u32 a = SDL_GAMEPAD_AXIS_INVALID, bool p = true)
+        : button{b}, axis{a}, positive_axis{p} {}
     inline bool operator==(const ControllerOutput& o) const { // fucking consts everywhere
         return button == o.button && axis == o.axis;
     }

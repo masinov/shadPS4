@@ -242,10 +242,6 @@ std::array<ControllerAllOutputs, 9> output_arrays = {
 };
 
 void ControllerOutput::LinkJoystickAxes() {
-    // for (int i = 17; i < 23; i += 2) {
-    //     delete output_array[i].new_param;
-    //     output_array[i].new_param = output_array[i + 1].new_param;
-    // }
 }
 
 static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
@@ -722,7 +718,7 @@ void ToggleKeyInList(InputID input) {
 void ControllerOutput::ResetUpdate() {
     state_changed = false;
     new_button_state = false;
-    *new_param = 0; // bruh
+    new_param = 0;
 }
 void ControllerOutput::AddUpdate(InputEvent event) {
     switch (button) {
@@ -746,7 +742,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
         }
 
     } else if (axis != SDL_GAMEPAD_AXIS_INVALID) {
-        *new_param = (event.active ? event.axis_value : 0) + *new_param;
+        new_param = (event.active ? event.axis_value : 0) + new_param;
     }
 }
 void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
@@ -758,12 +754,12 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             SDL_PushEvent(&e);
         }
     };
-    state_changed = old_button_state != new_button_state || old_param != *new_param;
+    state_changed = old_button_state != new_button_state || old_param != new_param;
     if (!state_changed) {
         return;
     }
     old_button_state = new_button_state;
-    old_param = *new_param;
+    old_param = new_param;
     GameController* controller;
     if (gamepad_index < 5)
         controller = controllers[gamepad_index];
@@ -877,28 +873,28 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         switch (c_axis) {
         case Axis::LeftX:
         case Axis::LeftY:
-            ApplyDeadzone(new_param, leftjoystick_deadzone[gamepad_index]);
+            ApplyDeadzone(&new_param, leftjoystick_deadzone[gamepad_index]);
             multiplier = leftjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::RightX:
         case Axis::RightY:
-            ApplyDeadzone(new_param, rightjoystick_deadzone[gamepad_index]);
+            ApplyDeadzone(&new_param, rightjoystick_deadzone[gamepad_index]);
             multiplier = rightjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::TriggerLeft:
-            ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
-            controller->CheckButton(0, OrbisPadButtonDataOffset::L2, *new_param > 0x20);
+            ApplyDeadzone(&new_param, lefttrigger_deadzone[gamepad_index]);
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, new_param));
+            controller->CheckButton(0, OrbisPadButtonDataOffset::L2, new_param > 0x20);
             return;
         case Axis::TriggerRight:
-            ApplyDeadzone(new_param, righttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
-            controller->CheckButton(0, OrbisPadButtonDataOffset::R2, *new_param > 0x20);
+            ApplyDeadzone(&new_param, righttrigger_deadzone[gamepad_index]);
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, new_param));
+            controller->CheckButton(0, OrbisPadButtonDataOffset::R2, new_param > 0x20);
             return;
         default:
             break;
         }
-        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
+        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, new_param * multiplier));
     }
 }
 

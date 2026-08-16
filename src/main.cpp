@@ -286,7 +286,7 @@ int main(int argc, char* argv[]) {
             nullptr};
 
         int buttonid = -1;
-        if (SDL_ShowMessageBox(&messageboxdata, &buttonid) < 0) {
+        if (!SDL_ShowMessageBox(&messageboxdata, &buttonid)) {
             std::cerr << "Could not display SDL message box! Error: " << SDL_GetError() << "\n";
         }
 

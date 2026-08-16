@@ -36,6 +36,7 @@ GraphicsPipeline::GraphicsPipeline(
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
+    key_hash = std::hash<GraphicsPipelineKey>{}(key);
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);

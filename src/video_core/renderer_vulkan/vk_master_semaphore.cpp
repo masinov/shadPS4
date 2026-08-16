@@ -34,6 +34,9 @@ void MasterSemaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
+        if (counter_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceLoss("timeline semaphore counter query");
+        }
         ASSERT_MSG(counter_result == vk::Result::eSuccess,
                    "Failed to get master semaphore value: {}", vk::to_string(counter_result));
         counter = cntr;
@@ -62,8 +65,12 @@ void MasterSemaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    const auto wait_result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceLoss("timeline semaphore wait");
     }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess,
+               "Failed to wait for master semaphore tick {}: {}", tick, vk::to_string(wait_result));
     Refresh();
 }
 

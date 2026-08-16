@@ -48,21 +48,29 @@ struct UniqueImage {
     UniqueImage(const UniqueImage&) = delete;
     UniqueImage& operator=(const UniqueImage&) = delete;
 
-    UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+    UniqueImage(UniqueImage&& other) noexcept
+        : device{std::exchange(other.device, {})},
+          allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
-    UniqueImage& operator=(UniqueImage&& other) {
-        image = std::exchange(other.image, VK_NULL_HANDLE);
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          allocation_size{std::exchange(other.allocation_size, 0)} {}
+    UniqueImage& operator=(UniqueImage&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        Destroy();
+        device = std::exchange(other.device, {});
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+        image = std::exchange(other.image, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        allocation_size = std::exchange(other.allocation_size, 0);
         return *this;
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
 
-    void Destroy();
+    void Destroy() noexcept;
 
     operator vk::Image() const {
         return image;
@@ -78,6 +86,7 @@ public:
     VmaAllocation allocation{};
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
+    u64 allocation_size{};
 };
 
 class BlitHelper;
@@ -110,6 +119,14 @@ struct Image {
 
     bool SafeToDownload() const {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
+    }
+
+    [[nodiscard]] u64 AllocationSizeBytes() const noexcept {
+        u64 size{};
+        for (const auto& backing_image : backing_images) {
+            size += backing_image.image.allocation_size;
+        }
+        return size;
     }
 
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {

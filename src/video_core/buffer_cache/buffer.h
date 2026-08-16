@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -33,6 +34,12 @@ enum class MemoryUsage {
     Stream,      ///< Requests device local host visible buffer, falling back host memory.
 };
 
+enum class BufferRetirementReason : u32 {
+    Unknown,
+    CacheReplacement,
+    GarbageCollection,
+};
+
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
@@ -48,19 +55,30 @@ struct UniqueBuffer {
     UniqueBuffer(const UniqueBuffer&) = delete;
     UniqueBuffer& operator=(const UniqueBuffer&) = delete;
 
-    UniqueBuffer(UniqueBuffer&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+    UniqueBuffer(UniqueBuffer&& other) noexcept
+        : device{std::exchange(other.device, {})},
+          allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)} {}
-    UniqueBuffer& operator=(UniqueBuffer&& other) {
-        buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
+          bda_addr{std::exchange(other.bda_addr, 0)} {}
+    UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        Destroy();
+        device = std::exchange(other.device, {});
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+        buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+        bda_addr = std::exchange(other.bda_addr, 0);
         return *this;
     }
 
+    void Destroy() noexcept;
+
     void Create(const vk::BufferCreateInfo& image_ci, MemoryUsage usage,
-                VmaAllocationInfo* out_alloc_info);
+                VmaAllocationInfo* out_alloc_info,
+                const std::function<void()>& allocation_failure_callback = {});
 
     operator vk::Buffer() const {
         return buffer;
@@ -76,13 +94,14 @@ struct UniqueBuffer {
 class Buffer {
 public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                    MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
-                    u64 size_bytes_);
+                    MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_,
+                    const std::function<void()>& allocation_failure_callback = {});
+    ~Buffer();
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 
-    Buffer& operator=(Buffer&&) = default;
+    Buffer& operator=(Buffer&&) = delete;
     Buffer(Buffer&&) = default;
 
     void IncreaseStreamScore(int score) noexcept {
@@ -109,12 +128,29 @@ public:
         return size_bytes;
     }
 
+    [[nodiscard]] u64 AllocationSizeBytes() const noexcept {
+        return allocation_size;
+    }
+
     void SetLRUId(u64 id) noexcept {
         lru_id = id;
     }
 
     u64 LRUId() const noexcept {
         return lru_id;
+    }
+
+    void SetLastUseTick(u64 tick) noexcept {
+        last_use_tick = tick;
+    }
+
+    [[nodiscard]] u64 LastUseTick() const noexcept {
+        return last_use_tick;
+    }
+
+    void SetRetirementContext(BufferRetirementReason reason, u64 scheduled_tick) noexcept {
+        retirement_reason = reason;
+        retirement_scheduled_tick = scheduled_tick;
     }
 
     vk::Buffer Handle() const noexcept {
@@ -158,7 +194,12 @@ public:
     bool is_deleted{};
     int stream_score = 0;
     size_t size_bytes = 0;
+    u64 allocation_size = 0;
     u64 lru_id = 0;
+    u64 last_use_tick = 0;
+    u64 address_generation = 0;
+    u64 retirement_scheduled_tick = 0;
+    BufferRetirementReason retirement_reason{BufferRetirementReason::Unknown};
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

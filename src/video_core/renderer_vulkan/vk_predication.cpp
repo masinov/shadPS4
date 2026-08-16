@@ -63,11 +63,18 @@ static void ForEachContiguousRun(std::span<const u32> slots, Callback&& callback
     }
 }
 
-static u64 ReadQuerySamples(vk::Device device, vk::QueryPool query_pool,
-                            std::span<const u32> slots) {
+static std::optional<u64> ReadQuerySamples(const Instance& instance, vk::Device device,
+                                           vk::QueryPool query_pool, std::span<const u32> slots) {
     boost::container::small_vector<u64, 64> results(slots.size());
     u64 samples = 0;
+    u32 unavailable_count = 0;
+    u32 first_unavailable_slot = 0;
+    vk::Result first_unavailable_result = vk::Result::eSuccess;
+    bool device_lost = false;
     ForEachContiguousRun(slots, [&](u32 first, u32 count, size_t offset) {
+        if (device_lost) {
+            return;
+        }
         u64* const run_results = results.data() + offset;
         const auto batch_result =
             device.getQueryPoolResults(query_pool, first, count, count * sizeof(u64), run_results,
@@ -79,9 +86,19 @@ static u64 ReadQuerySamples(vk::Device device, vk::QueryPool query_pool,
             return;
         }
 
-        // Preserve the original per-query path as a driver-safe fallback. Besides handling
-        // unusual implementations, this also lets any available query in a rejected run
-        // contribute to the guest counter.
+        if (batch_result == vk::Result::eErrorDeviceLost) {
+            if (unavailable_count == 0) {
+                first_unavailable_slot = first;
+                first_unavailable_result = batch_result;
+            }
+            unavailable_count += count;
+            device_lost = true;
+            return;
+        }
+
+        // Preserve the original per-query path as a driver-safe fallback. The guest counter is
+        // updated only if the complete query window is available; publishing a partial total as
+        // valid silently changes predication decisions.
         for (u32 i = 0; i < count; ++i) {
             u64 result{};
             const u32 slot = first + i;
@@ -91,11 +108,27 @@ static u64 ReadQuerySamples(vk::Device device, vk::QueryPool query_pool,
             if (query_result == vk::Result::eSuccess) {
                 samples += result;
             } else {
-                LOG_WARNING(Render_Vulkan, "ZPASS query {} unavailable at writeback: {}", slot,
-                            vk::to_string(query_result));
+                if (unavailable_count++ == 0) {
+                    first_unavailable_slot = slot;
+                    first_unavailable_result = query_result;
+                }
+                if (query_result == vk::Result::eErrorDeviceLost) {
+                    device_lost = true;
+                    break;
+                }
             }
         }
     });
+    if (unavailable_count != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "ZPASS writeback kept invalid: {}/{} queries unavailable; first slot {}: {}",
+                    unavailable_count, slots.size(), first_unavailable_slot,
+                    vk::to_string(first_unavailable_result));
+        if (device_lost) {
+            instance.ReportDeviceLoss("ZPASS query result readback");
+        }
+        return std::nullopt;
+    }
     return samples;
 }
 
@@ -294,8 +327,8 @@ void PredicationManager::EnableFromBool(VAddr address, bool is_64bit, bool draw_
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(address, width, VideoCore::ObtainBufferFlags::None);
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
     const u32 qword = AllocScratchQwords(1);
+    const auto cmdbuf = scheduler.CommandBuffer();
 
     if (!is_64bit) {
         // Zero the full qword so the 32-bit copy below leaves the high dword clear.
@@ -319,7 +352,7 @@ void PredicationManager::EnableFromBool(VAddr address, bool is_64bit, bool draw_
     cmdbuf.copyBuffer(buffer->Handle(), counter_scratch.Handle(), copy);
 
     bool combine_on_gpu = false;
-    const u32 slot = SelectPredicateSlot(cmdbuf, combine, combine_on_gpu);
+    const u32 slot = SelectPredicateSlot(combine, combine_on_gpu);
     ReducePredicate(qword, 1, slot, combine_on_gpu);
     ActivateGpuPredicate(slot, draw_visible);
 }
@@ -331,7 +364,7 @@ void PredicationManager::Disable() {
 }
 
 std::optional<u32> PredicationManager::PrepareDrawQuery() {
-    if (!counting_enabled) {
+    if (!counting_enabled || instance.HasDeviceLoss()) {
         return std::nullopt;
     }
 
@@ -365,6 +398,7 @@ std::optional<u32> PredicationManager::PrepareDrawQuery() {
 void PredicationManager::BeginDraw(vk::CommandBuffer cmdbuf, std::optional<u32> query,
                                    bool packet_predicated) {
     if (packet_predicated && mode == Mode::Gpu) {
+        predicate_last_use[gpu_slot] = scheduler.CurrentTick();
         vk::ConditionalRenderingFlagsEXT flags{};
         if (gpu_inverted) {
             flags |= vk::ConditionalRenderingFlagBitsEXT::eInverted;
@@ -409,7 +443,7 @@ void PredicationManager::ReleaseQuerySlotsWhenDone(std::vector<u32>&& slots) {
         for (const u32 slot : slots) {
             query_busy[slot] = false;
         }
-        if (!instance.IsHostQueryResetSupported()) {
+        if (!instance.IsHostQueryResetSupported() || instance.HasDeviceLoss()) {
             return;
         }
         // The GPU tick containing the last use of these slots has completed, so they can be
@@ -425,9 +459,15 @@ void PredicationManager::ReleaseQuerySlotsWhenDone(std::vector<u32>&& slots) {
 }
 
 void PredicationManager::ResolveRecord(const DumpRecord& record) {
+    if (instance.HasDeviceLoss()) {
+        return;
+    }
     const auto device = instance.GetDevice();
-    const u64 samples = ReadQuerySamples(device, *query_pool, record.queries);
-    zpass_counter += samples;
+    const auto samples = ReadQuerySamples(instance, device, *query_pool, record.queries);
+    if (!samples) {
+        return;
+    }
+    zpass_counter += *samples;
     WriteGuestCounters(record.address, record.num_counter_pairs, zpass_counter);
 }
 
@@ -490,7 +530,6 @@ void PredicationManager::SetStatic(std::optional<bool> visible, bool draw_visibl
 void PredicationManager::BuildFromQueries(const std::vector<u32>& queries, bool draw_visible,
                                           bool combine) {
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
 
     if (queries.size() == 1 && !combine) {
         // Fast path for the canonical one-proxy-draw window: copy the low 32 bits of the query
@@ -498,6 +537,7 @@ void PredicationManager::BuildFromQueries(const std::vector<u32>& queries, bool 
         // reduction pass is needed; a count of exactly 2^32 is not reachable in practice.
         const u32 slot = AllocPredicateSlot();
         const u32 slot_size = GetPredicateSlotSize(instance);
+        const auto cmdbuf = scheduler.CommandBuffer();
 
         RecordBufferBarrier(
             cmdbuf,
@@ -540,6 +580,7 @@ void PredicationManager::BuildFromQueries(const std::vector<u32>& queries, bool 
     }
     const u32 count = static_cast<u32>(sorted.size());
     const u32 base = AllocScratchQwords(count);
+    const auto cmdbuf = scheduler.CommandBuffer();
     u32 dst = base;
     ForEachContiguousRun(sorted, [&](u32 first, u32 run, size_t) {
         cmdbuf.copyQueryPoolResults(*query_pool, first, run, counter_scratch.Handle(),
@@ -549,13 +590,12 @@ void PredicationManager::BuildFromQueries(const std::vector<u32>& queries, bool 
     });
 
     bool combine_on_gpu = false;
-    const u32 slot = SelectPredicateSlot(cmdbuf, combine, combine_on_gpu);
+    const u32 slot = SelectPredicateSlot(combine, combine_on_gpu);
     ReducePredicate(base, count, slot, combine_on_gpu);
     ActivateGpuPredicate(slot, draw_visible);
 }
 
-u32 PredicationManager::SelectPredicateSlot(vk::CommandBuffer cmdbuf, bool combine,
-                                            bool& combine_on_gpu) {
+u32 PredicationManager::SelectPredicateSlot(bool combine, bool& combine_on_gpu) {
     if (combine && mode == Mode::Gpu) {
         combine_on_gpu = true;
         return gpu_slot;
@@ -565,37 +605,52 @@ u32 PredicationManager::SelectPredicateSlot(vk::CommandBuffer cmdbuf, bool combi
         // Seed the slot with the previous visibility so the reduction ORs into it.
         const u32 slot_size = GetPredicateSlotSize(instance);
         const u64 value = *static_visible ? 1ULL : 0ULL;
-        cmdbuf.fillBuffer(predicate_buffer.Handle(), slot * slot_size, slot_size, value);
+        scheduler.CommandBuffer().fillBuffer(predicate_buffer.Handle(), slot * slot_size, slot_size,
+                                             value);
         combine_on_gpu = true;
     }
     return slot;
 }
 
 void PredicationManager::ActivateGpuPredicate(u32 slot, bool draw_visible) {
+    predicate_last_use[slot] = scheduler.CurrentTick();
     mode = Mode::Gpu;
     gpu_slot = slot;
     gpu_inverted = !draw_visible;
 }
 
 u32 PredicationManager::AllocPredicateSlot() {
-    // Slots are recycled ring-style; with 1024 slots and a handful of predications per frame a
-    // slot is only reused many frames after its last conditional-rendering read.
-    return predicate_cursor++ % NumPredicateSlots;
+    const u32 slot = predicate_cursor++ % NumPredicateSlots;
+    const u64 last_use = predicate_last_use[slot];
+    if (last_use != 0 && !scheduler.IsFree(last_use)) {
+        // The normal path remains nonblocking. Only an actual ring collision flushes and waits
+        // for the exact command-buffer tick that last read or wrote this slot.
+        scheduler.Wait(last_use);
+    }
+    predicate_last_use[slot] = scheduler.CurrentTick();
+    return slot;
 }
 
 u32 PredicationManager::AllocScratchQwords(u32 count) {
     ASSERT(count <= NumScratchQwords);
     if (scratch_cursor + count > NumScratchQwords) {
+        if (scratch_epoch_last_use != 0 && !scheduler.IsFree(scratch_epoch_last_use)) {
+            // Scratch allocations are disjoint until wrap. Retiring the preceding epoch before
+            // wrapping prevents transfer writes from overwriting an in-flight compute read.
+            scheduler.Wait(scratch_epoch_last_use);
+        }
         scratch_cursor = 0;
     }
     const u32 base = scratch_cursor;
     scratch_cursor += count;
+    scratch_epoch_last_use = scheduler.CurrentTick();
     return base;
 }
 
 void PredicationManager::ReducePredicate(u32 src_index, u32 count, u32 dst_slot,
                                          bool combine_on_gpu) {
     const auto cmdbuf = scheduler.CommandBuffer();
+    scratch_epoch_last_use = scheduler.CurrentTick();
 
     // Optimize barriers for AMD GPUs - use more precise stage masks and by-region dependency
     const vk::DependencyFlags dependency_flags =
@@ -656,6 +711,7 @@ void PredicationManager::ReducePredicate(u32 src_index, u32 count, u32 dst_slot,
     cmdbuf.pushConstants(*reduce_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                          sizeof(push_constants), &push_constants);
     // Compute shader now uses workgroup size of 64, so we dispatch 1 workgroup
+    instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::PredicationReduce);
     cmdbuf.dispatch(1, 1, 1);
 
     // Optimize post-barrier for AMD GPUs

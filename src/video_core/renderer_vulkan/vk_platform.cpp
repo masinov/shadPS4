@@ -21,6 +21,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/device_address_tracker.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #ifdef __APPLE__
@@ -35,6 +36,28 @@ static const char* const CRASH_DIAGNOSTIC_LAYER_NAME = "VK_LAYER_LUNARG_crash_di
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type,
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* user_data) {
+
+    if (type & vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding) {
+        auto* tracker = static_cast<DeviceAddressTracker*>(user_data);
+        for (auto* next = static_cast<const VkBaseInStructure*>(callback_data->pNext); next;
+             next = next->pNext) {
+            if (next->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) {
+                continue;
+            }
+            const auto* binding =
+                reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(next);
+            const bool internal =
+                (binding->flags & VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT) != 0;
+            if (binding->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT) {
+                tracker->Bind(binding->baseAddress, binding->size, internal);
+            } else if (binding->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT) {
+                tracker->Unbind(binding->baseAddress, binding->size, internal);
+            }
+        }
+        if (type == vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding) {
+            return VK_FALSE;
+        }
+    }
 
     Common::Log::Level level{};
     switch (severity) {
@@ -443,16 +466,23 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     return std::move(instance);
 }
 
-vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {
+vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance,
+                                                     DeviceAddressTracker* address_tracker,
+                                                     bool track_device_addresses) {
+    auto message_types = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                         vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                         vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance;
+    if (track_device_addresses) {
+        message_types |= vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
+    }
     const vk::DebugUtilsMessengerCreateInfoEXT msg_ci = {
         .messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
                            vk::DebugUtilsMessageSeverityFlagBitsEXT::eError |
                            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
                            vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose,
-        .messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
-                       vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
-                       vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance,
+        .messageType = message_types,
         .pfnUserCallback = DebugUtilsCallback,
+        .pUserData = address_tracker,
     };
     auto [messenger_result, messenger] = instance.createDebugUtilsMessengerEXTUnique(msg_ci);
     ASSERT_MSG(messenger_result == vk::Result::eSuccess, "Failed to create debug callback: {}",

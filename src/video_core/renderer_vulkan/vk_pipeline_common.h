@@ -57,6 +57,12 @@ public:
         return is_compute;
     }
 
+    /// Hash of the pipeline key, computed once at creation. Diagnostics identify pipelines by
+    /// this value; recomputing it per draw would hash the full key on every submission.
+    u64 GetKeyHash() const noexcept {
+        return key_hash;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
@@ -74,6 +80,7 @@ protected:
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    u64 key_hash{};
     bool uses_push_descriptors{};
     bool is_compute;
 };

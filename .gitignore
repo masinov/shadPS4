@@ -421,3 +421,6 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Local diagnostic bundles and generated analysis reports
+/local-reports/

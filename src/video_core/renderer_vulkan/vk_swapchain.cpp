@@ -108,6 +108,10 @@ bool Swapchain::AcquireNextImage() {
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
 
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceLoss("swapchain image acquisition");
+    }
+
     switch (result) {
     case vk::Result::eSuccess:
         break;
@@ -138,6 +142,9 @@ bool Swapchain::Present() {
     };
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceLoss("swapchain presentation");
+    }
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {

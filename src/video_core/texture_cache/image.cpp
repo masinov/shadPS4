@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <ranges>
 #include "common/assert.h"
+#include "common/config.h"
+#include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -86,23 +88,22 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
-void UniqueImage::Destroy() {
+void UniqueImage::Destroy() noexcept {
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
+        allocation_size = 0;
     }
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     // ASSERT(!image);
-    const VmaAllocationCreateInfo alloc_info = {
+    VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -113,11 +114,31 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
+    VmaAllocationInfo allocation_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
-                                     &allocation, nullptr);
+                                     &allocation, &allocation_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        const bool use_host_fallback = Config::getUseHostMemoryFallback();
+        LOG_WARNING(Render_Vulkan,
+                    "Image allocation {}x{}x{} ({}) failed within the reported memory budget; "
+                    "retrying without the budget restriction{}",
+                    image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                    vk::to_string(image_ci.format),
+                    use_host_fallback ? " with host memory fallback" : "");
+        alloc_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (use_host_fallback) {
+            alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        }
+        unsafe_image = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        allocation_info = {};
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
+                                &allocation, &allocation_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
+    allocation_size = allocation_info.size;
 }
 
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -210,8 +231,7 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     }
 
     ImageViewInfo clamped_view_info = view_info;
-    if (MemoryPatcher::g_game_serial == "CUSA01968" ||
-        MemoryPatcher::g_game_serial == "CUSA01936") {
+    if (MemoryPatcher::Quirks().image_transition_workaround) {
         clamped_view_info.range = ClampSubresourceRange(view_info.range, info.resources);
         if (clamped_view_info.range != view_info.range) {
             LOG_WARNING(Render_Vulkan, "Clamped invalid image view range in FindView");
@@ -236,8 +256,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
-    if (subres_range && (MemoryPatcher::g_game_serial == "CUSA01968" ||
-                         MemoryPatcher::g_game_serial == "CUSA01936")) {
+    if (subres_range && MemoryPatcher::Quirks().image_transition_workaround) {
         SubresourceRange original_range = *subres_range;
         *subres_range = ClampSubresourceRange(*subres_range, info.resources);
         if (*subres_range != original_range) {
@@ -745,8 +764,7 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
                     const VideoCore::SubresourceRange& mrt1_range) {
     VideoCore::SubresourceRange clamped_mrt0_range = mrt0_range;
     VideoCore::SubresourceRange clamped_mrt1_range = mrt1_range;
-    if (MemoryPatcher::g_game_serial == "CUSA01968" ||
-        MemoryPatcher::g_game_serial == "CUSA01936") {
+    if (MemoryPatcher::Quirks().image_transition_workaround) {
         clamped_mrt0_range = ClampSubresourceRange(mrt0_range, src_image.info.resources);
         clamped_mrt1_range = ClampSubresourceRange(mrt1_range, info.resources);
         if (clamped_mrt0_range != mrt0_range || clamped_mrt1_range != mrt1_range) {
@@ -813,8 +831,7 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
 
 void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {
     VideoCore::SubresourceRange clamped_range = range;
-    if (MemoryPatcher::g_game_serial == "CUSA01968" ||
-        MemoryPatcher::g_game_serial == "CUSA01936") {
+    if (MemoryPatcher::Quirks().image_transition_workaround) {
         clamped_range = ClampSubresourceRange(range, info.resources);
         if (clamped_range != range) {
             LOG_WARNING(Render_Vulkan, "Clamped invalid clear range");

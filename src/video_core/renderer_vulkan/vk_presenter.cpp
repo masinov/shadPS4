@@ -33,8 +33,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -631,18 +631,7 @@ Frame* Presenter::PrepareLastFrame() {
 
     Frame* frame = last_submit_frame;
 
-    while (true) {
-        vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
-                                                               std::numeric_limits<u64>::max());
-        if (result == vk::Result::eSuccess) {
-            break;
-        }
-        if (result == vk::Result::eTimeout) {
-            continue;
-        }
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-    }
+    WaitForPresentFence(frame);
 
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
@@ -657,8 +646,8 @@ Frame* Presenter::PrepareLastFrame() {
     };
 
     const auto pre_barrier =
-        vk::ImageMemoryBarrier2{.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+        vk::ImageMemoryBarrier2{.srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
                                 .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                 .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
                                 .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -713,8 +702,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     const auto pre_barrier = vk::ImageMemoryBarrier2{
-        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
@@ -801,8 +790,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
         .layerCount = 1,
     };
     const auto pre_barrier = vk::ImageMemoryBarrier2{
-        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
@@ -870,13 +859,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         }
     };
 
+    // Swapchain recreation waits for the device to go idle; vkDeviceWaitIdle requires external
+    // synchronization of every queue, so it must exclude concurrent scheduler submissions.
+    const auto recreate_swapchain = [&] {
+        Scheduler::SubmitLock recreate_lock{SubmitCriticalPhase::SwapchainRecreate};
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    };
+
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        recreate_swapchain();
     }
 
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        recreate_swapchain();
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -936,7 +932,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             },
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -955,7 +951,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         bool swapchain_copied_for_screenshot = false;
 
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                                   vk::PipelineStageFlagBits::eFragmentShader,
                                vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
 
         { // Draw the game
@@ -1092,17 +1089,53 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     }
 
     SubmitInfo info{};
-    info.AddWait(swapchain.GetImageAcquiredSemaphore());
-    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    info.AddWait(swapchain.GetImageAcquiredSemaphore(), 1,
+                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
+    info.AddWait(frame->ready_semaphore, frame->ready_tick,
+                 vk::PipelineStageFlagBits::eFragmentShader);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    frame->present_tick = present_scheduler.CurrentTick();
     scheduler.Flush(info);
 
-    // Present to swapchain.
+    // Present to swapchain. Presentation shares the graphics queue and therefore the global
+    // queue mutex; while vkQueuePresentKHR blocks (vsync, compositor, driver back-pressure) every
+    // other scheduler submission waits behind it. Publish the phase and time it so a long
+    // "submit_lock" wait elsewhere can be attributed to presentation rather than to the waiter.
+    // With a dedicated presentation queue the graphics mutex is not needed at all and the
+    // command processor keeps submitting while this thread waits on the display.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        const auto present_start = std::chrono::steady_clock::now();
+        std::optional<Scheduler::SubmitLock> submit_lock;
+        if (!instance.HasDedicatedPresentQueue()) {
+            submit_lock.emplace(SubmitCriticalPhase::Present);
+        }
+        const auto lock_end = std::chrono::steady_clock::now();
+        const bool presented = swapchain.Present();
+        const auto present_end = std::chrono::steady_clock::now();
+        if (!presented) {
+            if (submit_lock) {
+                Scheduler::SetSubmitCriticalPhase(SubmitCriticalPhase::SwapchainRecreate);
+                swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            } else {
+                recreate_swapchain();
+            }
+        }
+        const auto recreate_end = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+        };
+        const auto total_ms = elapsed_ms(present_start, recreate_end);
+        if (total_ms >= 100) {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow swapchain presentation: total={} ms, submit_lock={} ms, "
+                        "contended_phase={}, present={} ms, recreate={} ms, frame={}, "
+                        "dedicated_queue={}",
+                        total_ms, elapsed_ms(present_start, lock_end),
+                        SubmitCriticalPhaseName(submit_lock ? submit_lock->ContendedPhase()
+                                                            : SubmitCriticalPhase::None),
+                        elapsed_ms(lock_end, present_end), elapsed_ms(present_end, recreate_end),
+                        frame->id, instance.HasDedicatedPresentQueue());
         }
     }
 
@@ -1125,23 +1158,8 @@ Frame* Presenter::GetRenderFrame() {
         free_queue.pop();
     }
 
-    const vk::Device device = instance.GetDevice();
-    vk::Result result{};
-
-    const auto wait = [&]() {
-        result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
-        return result;
-    };
-
     // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        // ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-        //   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
-        }
-    }
+    WaitForPresentFence(frame);
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
@@ -1149,6 +1167,56 @@ Frame* Presenter::GetRenderFrame() {
     }
 
     return frame;
+}
+
+void Presenter::WaitForPresentFence(Frame* frame) {
+    // A single infinite driver wait turns a stalled queue into a completely opaque process hang.
+    // Bounded waits are semantically equivalent for resource reuse and let us report which
+    // scheduler dependency stopped advancing without ever reusing an in-flight frame.
+    static constexpr u64 WaitSliceNs = 1'000'000'000;
+    u64 timeout_count{};
+    while (true) {
+        const vk::Result result =
+            instance.GetDevice().waitForFences(frame->present_done, true, WaitSliceNs);
+        if (result == vk::Result::eSuccess) {
+            return;
+        }
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceLoss("present-frame fence wait");
+        }
+        ASSERT_MSG(result == vk::Result::eTimeout, "Present fence wait failed for frame {}: {}",
+                   frame->id, vk::to_string(result));
+
+        ++timeout_count;
+        if (timeout_count > 4 && (timeout_count & (timeout_count - 1)) != 0) {
+            continue;
+        }
+
+        auto* draw_master = draw_scheduler.GetMasterSemaphore();
+        auto* present_master = present_scheduler.GetMasterSemaphore();
+        auto* flip_master = flip_scheduler.GetMasterSemaphore();
+        draw_master->Refresh();
+        present_master->Refresh();
+        flip_master->Refresh();
+
+        std::string_view ready_owner = "unknown";
+        if (frame->ready_semaphore == draw_master->Handle()) {
+            ready_owner = "draw";
+        } else if (frame->ready_semaphore == present_master->Handle()) {
+            ready_owner = "present";
+        } else if (frame->ready_semaphore == flip_master->Handle()) {
+            ready_owner = "flip";
+        }
+
+        LOG_ERROR(Render_Vulkan,
+                  "Presentation fence stalled: frame={}, waited={} s, ready_owner={}, "
+                  "ready_tick={}, present_tick={}, draw_gpu/cpu={}/{}, "
+                  "present_gpu/cpu={}/{}, flip_gpu/cpu={}/{}",
+                  frame->id, timeout_count, ready_owner, frame->ready_tick, frame->present_tick,
+                  draw_master->KnownGpuTick(), draw_master->CurrentTick(),
+                  present_master->KnownGpuTick(), present_master->CurrentTick(),
+                  flip_master->KnownGpuTick(), flip_master->CurrentTick());
+    }
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {

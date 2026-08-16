@@ -24,6 +24,13 @@ public:
     // itself a lock)
     static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
 
+    struct WatcherState {
+        u32 aggregate{};
+        u32 write{};
+        u32 read{};
+        bool fast_path{};
+    };
+
 public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
@@ -41,6 +48,9 @@ public:
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
+
+    /// Returns a consistent snapshot of the watcher counters for diagnostics.
+    [[nodiscard]] WatcherState GetWatcherState(VAddr address) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

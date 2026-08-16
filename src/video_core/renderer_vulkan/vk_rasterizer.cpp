@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <limits>
 
 #include "common/config.h"
 #include "common/debug.h"
@@ -28,15 +30,8 @@
 namespace Vulkan {
 
 static bool ShouldDisableSync() {
-    const auto& serial = Common::ElfInfo::Instance().GameSerial();
-    return serial == "CUSA03173" || serial == "CUSA00900" || serial == "CUSA00208" ||
-           serial == "CUSA01363" || serial == "CUSA01322" || serial == "CUSA003027" ||
-           serial == "CUSA00299" || serial == "CUSA00207" || serial == "CUSA03014" ||
-           serial == "CUSA03023" || serial == "CUSA03014" || serial == "CUSA00900" ||
-           serial == "CUSA03388" || serial == "CUSA01589" || serial == "CUSA01760" ||
-           serial == "CUSA07439" || serial == "CUSA07339" || serial == "CUSA08692" ||
-           serial == "CUSA08495" || serial == "CUSA50617" || serial == "CUSA18723" ||
-           serial == "CUSA28863" || serial == "CUSA00093" || serial == "CUSA00003";
+    // Evaluated once at game load; this runs on every dispatch, submit and render-target bind.
+    return MemoryPatcher::Quirks().disable_render_sync;
 }
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -59,6 +54,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       rt_sync_{instance, scheduler, texture_cache}, liverpool{liverpool_},
       predication{instance, scheduler, buffer_cache}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool} {
+    buffer_cache.SetAllocationReclaimCallback(
+        [this](u64 reclaim_target, u64 allocation_size, bool forced, bool allow_texture_gc) {
+            ReclaimForAllocation(reclaim_target, allocation_size, forced, allow_texture_gc);
+        });
     if (!Config::nullGpu()) {
         liverpool->BindRasterizer(this);
     }
@@ -234,11 +233,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     const auto state = BeginRendering(pipeline);
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    // Resolve every cache buffer before recording any draw state. Buffer resolution can allocate
+    // and therefore flush the scheduler; state recorded before such a flush would end up in a
+    // command buffer that does not contain the draw.
+    const auto vertex_binding = buffer_cache.PrepareVertexBuffers(*pipeline, buffer_barriers);
+    VideoCore::BufferCache::IndexBufferBinding index_binding{};
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+        index_binding = buffer_cache.PrepareIndexBuffer(index_offset, buffer_barriers);
     }
 
+    buffer_cache.BindVertexBuffers(vertex_binding);
+    if (is_indexed) {
+        buffer_cache.BindIndexBuffer(index_binding);
+    }
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     const auto zpass_query = predication.PrepareDrawQuery();
@@ -252,6 +259,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
     predication.BeginDraw(cmdbuf, zpass_query, predicated);
+    if (instance.HasDiagnosticCheckpoints()) {
+        auto checkpoint =
+            MakeCheckpointContext(*pipeline, pipeline->GetKeyHash(), is_indexed, predicated);
+        checkpoint.item_count = regs.num_indices;
+        checkpoint.instance_count = regs.num_instances.NumInstances();
+        instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::DirectDraw, checkpoint);
+    }
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -287,9 +301,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     const auto state = BeginRendering(pipeline);
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    // Resolve every cache buffer (vertex, index, indirect arguments, count) before recording any
+    // draw state; see Draw().
+    const auto vertex_binding = buffer_cache.PrepareVertexBuffers(*pipeline, buffer_barriers);
+    VideoCore::BufferCache::IndexBufferBinding index_binding{};
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        index_binding = buffer_cache.PrepareIndexBuffer(0, buffer_barriers);
     }
 
     const auto& [buffer, base] =
@@ -312,17 +329,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
-        buffer_barriers.emplace_back(*barrier);
+    buffer_cache.BindVertexBuffers(vertex_binding);
+    if (is_indexed) {
+        buffer_cache.BindIndexBuffer(index_binding);
     }
-    if (count_buffer) {
-        if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                                    vk::PipelineStageFlagBits2::eDrawIndirect)) {
-            buffer_barriers.emplace_back(*barrier);
-        }
-    }
-
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     const auto zpass_query = predication.PrepareDrawQuery();
@@ -335,6 +345,22 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
     predication.BeginDraw(cmdbuf, zpass_query, predicated);
+    if (instance.HasDiagnosticCheckpoints()) {
+        auto checkpoint =
+            MakeCheckpointContext(*pipeline, pipeline->GetKeyHash(), is_indexed, predicated);
+        // item_count is the maximum draw-command count supplied by the guest; the actual draw
+        // parameters live in the argument buffer, whose provenance is recorded through the
+        // transfer fields (source = argument buffer, destination = optional count buffer).
+        checkpoint.item_count = max_count;
+        checkpoint.indirect_arguments = true;
+        checkpoint.source_guest_address = arg_address + offset;
+        checkpoint.transfer_size = static_cast<u64>(stride) * max_count;
+        checkpoint.source_generation = buffer->address_generation;
+        checkpoint.source_offset = base;
+        checkpoint.destination_guest_address = count_address;
+        checkpoint.destination_generation = count_buffer ? count_buffer->address_generation : 0;
+        instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::IndirectDraw, checkpoint);
+    }
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -389,6 +415,14 @@ void Rasterizer::DispatchDirect() {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     predication.BeginDraw(cmdbuf, std::nullopt, predicated);
+    if (instance.HasDiagnosticCheckpoints()) {
+        auto checkpoint =
+            MakeCheckpointContext(*pipeline, pipeline->GetKeyHash(), false, predicated);
+        checkpoint.group_x = cs_program.dim_x;
+        checkpoint.group_y = cs_program.dim_y;
+        checkpoint.group_z = cs_program.dim_z;
+        instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::DirectDispatch, checkpoint);
+    }
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     predication.EndDraw(cmdbuf, std::nullopt, predicated);
     DebugState.IncDispatch();
@@ -431,6 +465,16 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     predication.BeginDraw(cmdbuf, std::nullopt, predicated);
+    if (instance.HasDiagnosticCheckpoints()) {
+        auto checkpoint =
+            MakeCheckpointContext(*pipeline, pipeline->GetKeyHash(), false, predicated);
+        checkpoint.indirect_arguments = true;
+        checkpoint.source_guest_address = address + offset;
+        checkpoint.transfer_size = size;
+        checkpoint.source_generation = buffer->address_generation;
+        checkpoint.source_offset = base;
+        instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::IndirectDispatch, checkpoint);
+    }
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     predication.EndDraw(cmdbuf, std::nullopt, predicated);
     DebugState.IncDispatch();
@@ -454,7 +498,162 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+std::pair<VideoCore::GcResult, VideoCore::GcResult> Rasterizer::RunSharedGarbageCollector(
+    VideoCore::GcBudget& budget) {
+    VideoCore::GcResult texture_result;
+    VideoCore::GcResult buffer_result;
+    if (gc_texture_first) {
+        texture_result = texture_cache.RunGarbageCollector(budget);
+        buffer_result = buffer_cache.RunGarbageCollector(budget);
+    } else {
+        buffer_result = buffer_cache.RunGarbageCollector(budget);
+        texture_result = texture_cache.RunGarbageCollector(budget);
+    }
+    if (budget.pressure != VideoCore::GcPressure::None) {
+        gc_texture_first = !gc_texture_first;
+    }
+    return {std::move(texture_result), std::move(buffer_result)};
+}
+
+void Rasterizer::ReclaimForAllocation(u64 reclaim_target, u64 allocation_size, bool forced,
+                                      bool allow_texture_gc) {
+    auto* const master_semaphore = scheduler.GetMasterSemaphore();
+    if (!forced) {
+        // Preflight collection must remain non-blocking. Sample the completed timeline once so the
+        // collectors can select only resources whose exact last use is already finished.
+        master_semaphore->Refresh();
+    }
+    VideoCore::GcBudget budget{
+        .bytes_remaining = reclaim_target,
+        .completed_tick = master_semaphore->KnownGpuTick(),
+        .objects_remaining = 256,
+        .pressure = VideoCore::GcPressure::Critical,
+        .collect_retirements = true,
+        .require_completed = !forced,
+    };
+    const u64 used_before = instance.GetDeviceMemoryUsage();
+
+    const auto gc_start = std::chrono::steady_clock::now();
+    VideoCore::GcResult texture_result;
+    VideoCore::GcResult buffer_result;
+    if (allow_texture_gc) {
+        std::tie(texture_result, buffer_result) = RunSharedGarbageCollector(budget);
+    } else {
+        // This allocation originates in TextureCache::RefreshImage while its non-recursive mutex
+        // is held. Collecting textures here would self-deadlock; buffer collection remains safe.
+        buffer_result = buffer_cache.RunGarbageCollector(budget);
+    }
+    const auto gc_end = std::chrono::steady_clock::now();
+    const u64 reclaimed = texture_result.reclaimed_bytes + buffer_result.reclaimed_bytes;
+    const u64 retirement_tick =
+        std::max(texture_result.latest_use_tick, buffer_result.latest_use_tick);
+    const u32 skipped_in_flight =
+        texture_result.skipped_in_flight + buffer_result.skipped_in_flight;
+    const u32 skipped_pending = texture_result.skipped_pending + buffer_result.skipped_pending;
+    const u32 skipped_unallocated =
+        texture_result.skipped_unallocated + buffer_result.skipped_unallocated;
+
+    // Preflight collection only selected resources at or below the completed timeline sample, so
+    // their retirement is immediately safe. After a real allocation failure, the forced path may
+    // select older in-flight resources and waits for their exact latest use. If that is still not
+    // enough, a full finish remains the last-resort path that retires general deferred operations.
+    const bool target_met = budget.bytes_remaining == 0;
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (forced && reclaimed != 0) {
+        scheduler.Wait(retirement_tick);
+    }
+    if (forced && (reclaimed == 0 || budget.bytes_remaining != 0)) {
+        scheduler.Finish();
+    }
+    const auto wait_end = std::chrono::steady_clock::now();
+
+    // "reclaimed" counts bytes selected by the collectors; the physical release only happens here
+    // when the retirement callbacks destroy the Vulkan objects. Report both so a pass that selects
+    // a lot but retires little (or nothing) is visible as such.
+    const auto texture_retire_start = std::chrono::steady_clock::now();
+    const u32 texture_retired = texture_result.ExecuteRetirements();
+    const auto texture_retire_end = std::chrono::steady_clock::now();
+    const u32 buffer_retired = buffer_result.ExecuteRetirements();
+    const auto buffer_retire_end = std::chrono::steady_clock::now();
+    const bool released = (texture_retired + buffer_retired) != 0;
+
+    // Ordinary preflight retirement is self-contained; do not make the allocation path execute
+    // every unrelated callback whose tick also happened to complete. Emergency completion still
+    // drains the general queue because an actual allocation failure needs every available byte.
+    if (forced) {
+        scheduler.PopPendingOperations();
+    }
+    const auto pending_end = std::chrono::steady_clock::now();
+
+    // Several GC calls can occur while one guest submission is being recorded. If current-use
+    // exclusions prevented the requested reclaim, submit that work without waiting so the next
+    // allocation observes a new tick and can reclaim those resources once they really complete.
+    const bool advanced_tick = !forced && budget.bytes_remaining != 0 && skipped_in_flight != 0;
+    if (advanced_tick) {
+        scheduler.Flush();
+    }
+    const auto advance_end = std::chrono::steady_clock::now();
+    if (released || forced || advanced_tick) {
+        instance.SetMemoryAllocatorFrameIndex(++memory_allocator_frame_index);
+    }
+    const auto reclaim_end = std::chrono::steady_clock::now();
+    const auto gc_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(gc_end - gc_start).count();
+    const auto drain_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(reclaim_end - gc_end).count();
+    const auto wait_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(wait_end - wait_start).count();
+    const auto texture_retire_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            texture_retire_end - texture_retire_start)
+                                            .count();
+    const auto buffer_retire_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           buffer_retire_end - texture_retire_end)
+                                           .count();
+    const auto pending_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(pending_end - buffer_retire_end)
+            .count();
+    const auto advance_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(advance_end - pending_end).count();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(reclaim_end - gc_start).count();
+    const u64 used_after = instance.GetDeviceMemoryUsage();
+    const bool sample = VideoCore::ShouldLogDiagnosticSample(++allocation_gc_pass_count);
+    if (forced || elapsed >= 50 || sample) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "{}allocation GC: allocation={} MiB, usage={} -> {} MiB, budget={} MiB, "
+            "target={} MiB, texture_gc={}, inspected={} (textures={}, buffers={}), "
+            "evicted={} (textures={}, buffers={}), selected={} MiB, retired_objects={} "
+            "(textures={}, buffers={}), released_delta={} MiB, remaining={} MiB, "
+            "skipped_in_flight={} (textures={}, buffers={}), skipped_unallocated={}, "
+            "skipped_pending={} (textures={}, buffers={}), completed_tick={}, retire_tick={}, "
+            "gc={} ms, wait={} ms, texture_retire={} ms, buffer_retire={} ms, "
+            "pending={} ms, advance={} ms, drain={} ms, elapsed={} ms, target_met={}, "
+            "released={}, advanced_tick={}, sample={}",
+            forced ? "Emergency " : "Preflight ", allocation_size / 1_MB, used_before / 1_MB,
+            used_after / 1_MB, instance.GetTotalMemoryBudget() / 1_MB, reclaim_target / 1_MB,
+            allow_texture_gc, texture_result.inspected_objects + buffer_result.inspected_objects,
+            texture_result.inspected_objects, buffer_result.inspected_objects,
+            texture_result.evicted_objects + buffer_result.evicted_objects,
+            texture_result.evicted_objects, buffer_result.evicted_objects, reclaimed / 1_MB,
+            texture_retired + buffer_retired, texture_retired, buffer_retired,
+            (used_before > used_after ? used_before - used_after : 0) / 1_MB,
+            budget.bytes_remaining / 1_MB, skipped_in_flight, texture_result.skipped_in_flight,
+            buffer_result.skipped_in_flight, skipped_unallocated, skipped_pending,
+            texture_result.skipped_pending, buffer_result.skipped_pending, budget.completed_tick,
+            retirement_tick, gc_elapsed, wait_elapsed, texture_retire_elapsed,
+            buffer_retire_elapsed, pending_elapsed, advance_elapsed, drain_elapsed, elapsed,
+            target_met, released, advanced_tick, sample);
+    }
+}
+
 void Rasterizer::OnSubmit() {
+    instance.SetMemoryAllocatorFrameIndex(++memory_allocator_frame_index);
+    // Eviction age is counted in guest submissions, independently of how many collector passes
+    // allocation preflight ran in between.
+    buffer_cache.AdvanceGcEpoch();
+    texture_cache.AdvanceGcEpoch();
+
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -466,15 +665,85 @@ void Rasterizer::OnSubmit() {
         rt_sync_.ClearRecords();
     }
 
-    static u64 gc_timer = 0;
-    if (++gc_timer > 60) {
-        gc_timer = 0;
-        const u64 used_mem = instance.GetDeviceMemoryUsage();
-        const u64 trigger = texture_cache.GetTriggerGcMemory();
-        if (used_mem > trigger) {
-            texture_cache.RunGarbageCollectorAsync();
-            buffer_cache.RunGarbageCollectorAsync();
+    if (++gc_submit_count >= 60) {
+        gc_submit_count = 0;
+
+        VideoCore::GcBudget gc_budget;
+        u64 used_memory{};
+        u64 total_budget{};
+        u64 trigger_memory{};
+        u64 critical_memory{};
+        used_memory = instance.GetDeviceMemoryUsage();
+        total_budget = instance.GetTotalMemoryBudget();
+
+        // The instance budget already reserves memory for the OS. Begin reclaiming with about
+        // 1 GiB of emulator headroom and become aggressive with about 512 MiB left.
+        const u64 trigger_headroom = std::min<u64>(std::max<u64>(total_budget / 5, 256_MB), 1_GB);
+        const u64 critical_headroom =
+            std::min<u64>(std::max<u64>(total_budget / 10, 128_MB), 512_MB);
+        trigger_memory = total_budget > trigger_headroom ? total_budget - trigger_headroom : 0;
+        critical_memory = total_budget > critical_headroom ? total_budget - critical_headroom : 0;
+
+        if (used_memory >= critical_memory) {
+            gc_budget.pressure = VideoCore::GcPressure::Critical;
+            gc_budget.objects_remaining = 256;
+        } else if (used_memory >= trigger_memory) {
+            gc_budget.pressure = VideoCore::GcPressure::High;
+            gc_budget.objects_remaining = 24;
         }
+
+        if (gc_budget.pressure != VideoCore::GcPressure::None) {
+            const u64 hysteresis = std::min<u64>(trigger_memory / 8, 256_MB);
+            const u64 target_memory = trigger_memory > hysteresis ? trigger_memory - hysteresis : 0;
+            gc_budget.bytes_remaining = used_memory - target_memory;
+        }
+
+        const bool pressure_changed = gc_budget.pressure != gc_pressure;
+        if (pressure_changed && gc_budget.pressure != VideoCore::GcPressure::None) {
+            LOG_INFO(Render_Vulkan,
+                     "VRAM GC entering {} pressure: usage={} MiB, budget={} MiB, "
+                     "target_reclaim={} MiB",
+                     gc_budget.pressure == VideoCore::GcPressure::Critical ? "critical" : "high",
+                     used_memory / 1_MB, total_budget / 1_MB, gc_budget.bytes_remaining / 1_MB);
+        }
+
+        const auto gc_start = std::chrono::steady_clock::now();
+        const auto [texture_result, buffer_result] = RunSharedGarbageCollector(gc_budget);
+        const auto gc_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - gc_start)
+                                    .count();
+
+        const u32 evicted = texture_result.evicted_objects + buffer_result.evicted_objects;
+        const u32 inspected = texture_result.inspected_objects + buffer_result.inspected_objects;
+        const u64 reclaimed = texture_result.reclaimed_bytes + buffer_result.reclaimed_bytes;
+        const u32 skipped_modified =
+            texture_result.skipped_gpu_modified + buffer_result.skipped_gpu_modified;
+        const u32 skipped_in_flight =
+            texture_result.skipped_in_flight + buffer_result.skipped_in_flight;
+        const u32 skipped_unallocated =
+            texture_result.skipped_unallocated + buffer_result.skipped_unallocated;
+        if (gc_elapsed >= 50) {
+            LOG_WARNING(Render_Vulkan,
+                        "VRAM GC pass took {} ms: inspected={}, evicted={} ({} MiB estimated), "
+                        "skipped_gpu_modified={}, skipped_in_flight={}, skipped_unallocated={}, "
+                        "remaining_target={} MiB",
+                        gc_elapsed, inspected, evicted, reclaimed / 1_MB, skipped_modified,
+                        skipped_in_flight, skipped_unallocated, gc_budget.bytes_remaining / 1_MB);
+        } else if (gc_budget.pressure != VideoCore::GcPressure::None &&
+                   (pressure_changed || ++gc_log_count >= 30)) {
+            gc_log_count = 0;
+            LOG_INFO(Render_Vulkan,
+                     "VRAM GC pass: inspected={}, evicted={} ({} MiB estimated), "
+                     "skipped_gpu_modified={}, skipped_bound={}, skipped_in_flight={}, "
+                     "skipped_unallocated={}, remaining_target={} MiB, elapsed={} ms",
+                     inspected, evicted, reclaimed / 1_MB, skipped_modified,
+                     texture_result.skipped_bound, skipped_in_flight, skipped_unallocated,
+                     gc_budget.bytes_remaining / 1_MB, gc_elapsed);
+        } else if (pressure_changed && gc_budget.pressure == VideoCore::GcPressure::None) {
+            LOG_INFO(Render_Vulkan, "VRAM GC pressure cleared at {} MiB usage", used_memory / 1_MB);
+        }
+
+        gc_pressure = gc_budget.pressure;
     }
 }
 
@@ -489,6 +758,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     pending_storage_image_ids_.clear();
+    checkpoint_writable_buffers.clear();
+    checkpoint_writable_images.clear();
 
     set_write_index = 0;
     set_writes.clear();
@@ -523,6 +794,42 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     return true;
+}
+
+GpuCheckpointContext Rasterizer::MakeCheckpointContext(const Pipeline& pipeline, u64 pipeline_hash,
+                                                       bool indexed, bool predicated) const {
+    GpuCheckpointContext context{
+        .pipeline_hash = pipeline_hash,
+        .writable_buffer_count = static_cast<u16>(checkpoint_writable_buffers.size()),
+        .writable_image_count = static_cast<u16>(checkpoint_writable_images.size()),
+        .indexed = indexed,
+        .predicated = predicated,
+    };
+    for (const auto* stage : pipeline.GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const size_t stage_index = static_cast<size_t>(stage->l_stage);
+        if (stage_index < context.shader_hashes.size()) {
+            context.shader_hashes[stage_index] = stage->pgm_hash;
+        }
+        context.uses_dma |= stage->uses_dma;
+    }
+    if (!pipeline.IsCompute()) {
+        const auto& render_state = scheduler.GetRenderState();
+        context.color_attachment_count = static_cast<u8>(render_state.num_color_attachments);
+        context.has_depth_attachment = render_state.depth_stencil_attachment.has_depth;
+        context.has_stencil_attachment = render_state.depth_stencil_attachment.has_stencil;
+    }
+    const size_t buffer_count =
+        std::min(context.writable_buffers.size(), checkpoint_writable_buffers.size());
+    std::ranges::copy_n(checkpoint_writable_buffers.begin(), buffer_count,
+                        context.writable_buffers.begin());
+    const size_t image_count =
+        std::min(context.writable_images.size(), checkpoint_writable_images.size());
+    std::ranges::copy_n(checkpoint_writable_images.begin(), image_count,
+                        context.writable_images.begin());
+    return context;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -694,6 +1001,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
+            if (desc.is_written) {
+                checkpoint_writable_buffers.emplace_back(vsharp.base_address, size,
+                                                         buffer_id.index);
+            }
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
         }
@@ -888,6 +1199,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                               image_id) == pending_storage_image_ids_.end()) {
                     pending_storage_image_ids_.push_back(image_id);
                 }
+                checkpoint_writable_images.emplace_back(desc.info.guest_address,
+                                                        desc.info.guest_size, image_id.index);
             }
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
@@ -960,10 +1273,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_cache.UpdateImage(image_id);
         image->SetBackingSamples(key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
-        const auto& serial = Common::ElfInfo::Instance().GameSerial();
-        if (!ShouldDisableSync() && serial != "CUSA11227" && serial != "CUSA12982" &&
-            serial != "CUSA00093" && serial != "CUSA00003" && serial != "CUSA01778" &&
-            serial != "CUSA01627") {
+        if (!ShouldDisableSync() && !MemoryPatcher::Quirks().skip_rt_write_record) {
             rt_sync_.RecordRtWrite(desc.info.guest_address, image_id);
             // 1�1 render target: force download to guest so CPU can read the result
             if (desc.info.size.width == 1 && desc.info.size.height == 1) {
@@ -1158,13 +1468,47 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool diagnose_repeated_fault) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+
+    VideoCore::PageManager::WatcherState watchers_before;
+    VideoCore::PageManager::WatcherState watchers_after_buffer;
+    if (diagnose_repeated_fault) {
+        watchers_before = page_manager.GetWatcherState(addr);
+    }
     buffer_cache.InvalidateMemory(addr, size, true);
+    if (diagnose_repeated_fault) {
+        watchers_after_buffer = page_manager.GetWatcherState(addr);
+    }
     texture_cache.InvalidateMemory(addr, size);
+    if (diagnose_repeated_fault) {
+        const auto watchers_after_texture = page_manager.GetWatcherState(addr);
+        const auto buffer_state = buffer_cache.GetDebugPageState(addr);
+        const auto texture_state = texture_cache.GetDebugPageState(addr);
+        LOG_ERROR(Render_Vulkan,
+                  "Repeated guest write fault cache state at {}: "
+                  "watchers before=({},{},{}) after_buffer=({},{},{}) "
+                  "after_texture=({},{},{}), fast_path={}; "
+                  "buffer id={}, range=[{:#x},{:#x}), registered={}, tracker_exists={}, "
+                  "cpu_modified={}, gpu_modified={}, gpu_pending={}; "
+                  "textures registered={}, tracked={}, cpu_dirty={}, gpu_modified={}, "
+                  "first_tracked_id={}, image_range=[{:#x},{:#x}), track_range=[{:#x},{:#x})",
+                  fmt::ptr(reinterpret_cast<void*>(addr)), watchers_before.aggregate,
+                  watchers_before.write, watchers_before.read, watchers_after_buffer.aggregate,
+                  watchers_after_buffer.write, watchers_after_buffer.read,
+                  watchers_after_texture.aggregate, watchers_after_texture.write,
+                  watchers_after_texture.read, watchers_after_texture.fast_path,
+                  buffer_state.buffer_id, buffer_state.buffer_begin, buffer_state.buffer_end,
+                  buffer_state.registered, buffer_state.tracker_exists, buffer_state.cpu_modified,
+                  buffer_state.gpu_modified, buffer_state.gpu_pending,
+                  texture_state.registered_images, texture_state.tracked_images,
+                  texture_state.cpu_dirty_images, texture_state.gpu_modified_images,
+                  texture_state.first_tracked_image, texture_state.image_begin,
+                  texture_state.image_end, texture_state.track_begin, texture_state.track_end);
+    }
     return true;
 }
 

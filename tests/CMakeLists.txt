@@ -9,7 +9,35 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test shadps4_zar_test)
+if (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # GoogleTest 1.17 intentionally prints char8_t through its Unicode code-point formatter.
+    # Clang-cl diagnoses that implementation under the project's global warnings-as-errors flags.
+    target_compile_options(gtest PRIVATE /clang:-Wno-character-conversion)
+endif()
+
+set(TEST_TARGETS
+    shadps4_settings_test
+    shadps4_gcn_test
+    shadps4_zar_test
+    shadps4_object_pool_test
+)
+
+set(OBJECT_POOL_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/veh_stack.cpp
+    common/test_lru_cache.cpp
+    common/test_object_pool.cpp
+    core/test_veh_stack.cpp
+    stubs/log_stub.cpp
+    video_core/test_bda_address_policy.cpp
+    video_core/test_device_address_tracker.cpp
+    video_core/test_fault_manager_policy.cpp
+    video_core/test_memory_gc.cpp
+    video_core/test_page_watcher_counter.cpp
+    video_core/test_pending_operation_queue.cpp
+    video_core/test_stream_buffer_policy.cpp
+    video_core/test_submit_info.cpp
+)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -126,6 +154,7 @@ set(GCN_TEST_SOURCES
 
     # Tests
     gcn/test_gcn_instructions.cpp
+    gcn/test_runtime_info.cpp
 )
 
 set(ZAR_TEST_SOURCES
@@ -156,6 +185,7 @@ set(ZAR_TEST_SOURCES
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 add_executable(shadps4_zar_test ${ZAR_TEST_SOURCES})
+add_executable(shadps4_object_pool_test ${OBJECT_POOL_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -201,6 +231,14 @@ target_link_libraries(shadps4_zar_test PRIVATE
     ZArchive::zarchive
 )
 
+target_link_libraries(shadps4_object_pool_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    Boost::headers
+    tsl::robin_map
+    Vulkan::Headers
+)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     include(CheckCXXSymbolExists)
@@ -241,6 +279,10 @@ gtest_discover_tests(shadps4_settings_test
     PROPERTIES TIMEOUT 60
 )
 gtest_discover_tests(shadps4_gcn_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    PROPERTIES TIMEOUT 60
+)
+gtest_discover_tests(shadps4_object_pool_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     PROPERTIES TIMEOUT 60
 )

@@ -3,18 +3,22 @@
 
 #pragma once
 
+#include <functional>
+
 #include <boost/container/small_vector.hpp>
-#include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/enum.h"
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/bda_address_policy.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/memory_gc.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/texture_cache/image.h"
 
 namespace AmdGpu {
@@ -23,10 +27,6 @@ struct Liverpool;
 
 namespace Core {
 class MemoryManager;
-}
-
-namespace Vulkan {
-class GraphicsPipeline;
 }
 
 namespace VideoCore {
@@ -43,6 +43,7 @@ enum class ObtainBufferFlags {
     IsTexelBuffer = 1 << 1,
     IgnoreStreamBuffer = 1 << 2,
     InvalidateTextureCache = 1 << 3,
+    AvoidTextureGc = 1 << 4,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ObtainBufferFlags)
 
@@ -51,31 +52,60 @@ public:
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
-    static constexpr u64 CACHING_NUMPAGES = u64{1} << (40 - CACHING_PAGEBITS);
+    static constexpr u64 CACHING_NUMPAGES = u64{1} << (BdaAddressSpaceBits - CACHING_PAGEBITS);
     static constexpr u64 BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
-
-    // Default values for garbage collection
-    static constexpr s64 DEFAULT_TRIGGER_GC_MEMORY = 1_GB;
-    static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 2_GB;
-    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
 
     struct PageData {
         BufferId buffer_id{};
     };
 
+    struct DebugPageState {
+        u32 buffer_id{Common::SlotId::INVALID_INDEX};
+        VAddr buffer_begin{};
+        VAddr buffer_end{};
+        bool registered{};
+        bool tracker_exists{};
+        bool cpu_modified{};
+        bool gpu_modified{};
+        bool gpu_pending{};
+    };
+
     struct Traits {
         using Entry = PageData;
-        static constexpr size_t AddressSpaceBits = 40;
+        static constexpr size_t AddressSpaceBits = BdaAddressSpaceBits;
         static constexpr size_t FirstLevelBits = 16;
         static constexpr size_t PageBits = CACHING_PAGEBITS;
     };
     using PageTable = MultiLevelPageTable<Traits>;
 
+    /// Host vertex input state resolved for one draw. Resolution (PrepareVertexBuffers) may
+    /// allocate cache buffers and therefore flush the scheduler; recording (BindVertexBuffers)
+    /// never does. Keeping the two apart guarantees the bound state lands in the same command
+    /// buffer as the draw that consumes it.
+    struct VertexBufferBinding {
+        Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        Vulkan::VertexInputs<vk::Buffer> host_buffers;
+        Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
+        Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
+        Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    };
+
+    struct IndexBufferBinding {
+        vk::Buffer buffer{};
+        vk::DeviceSize offset{};
+        vk::IndexType index_type{vk::IndexType::eUint16};
+    };
+
     struct OverlapResult {
         boost::container::small_vector<BufferId, 16> ids;
         VAddr begin;
         VAddr end;
+        int stream_score = 0;
         bool has_stream_leap = false;
+        bool stream_growth_suppressed = false;
+        u64 desired_stream_growth = 0;
+        u64 speculative_bytes = 0;
     };
 
 public:
@@ -131,13 +161,22 @@ public:
     /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image.
     void ReadEdgeImagePages(const Image& image);
 
-    /// Binds host vertex buffers for the current draw.
-    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
-                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    /// Resolves host vertex buffers for the current draw. May allocate cache buffers and flush
+    /// the scheduler, so it must run before any state of the draw is recorded.
+    [[nodiscard]] VertexBufferBinding PrepareVertexBuffers(
+        const Vulkan::GraphicsPipeline& pipeline,
+        boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
-    /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset,
-                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    /// Records the resolved vertex input state into the current command buffer. Never flushes.
+    void BindVertexBuffers(const VertexBufferBinding& binding);
+
+    /// Resolves the host index buffer for the current draw. May allocate cache buffers and flush
+    /// the scheduler, so it must run before any state of the draw is recorded.
+    [[nodiscard]] IndexBufferBinding PrepareIndexBuffer(
+        u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+
+    /// Records the resolved index buffer into the current command buffer. Never flushes.
+    void BindIndexBuffer(const IndexBufferBinding& binding);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -156,6 +195,9 @@ public:
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);
 
+    /// Returns non-mutating cache/tracker state for repeated-fault diagnostics.
+    [[nodiscard]] DebugPageState GetDebugPageState(VAddr addr);
+
     /// Return true when a CPU region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
 
@@ -171,7 +213,7 @@ public:
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
     /// Return buffer id for the specified region
-    BufferId FindBuffer(VAddr device_addr, u32 size);
+    BufferId FindBuffer(VAddr device_addr, u32 size, bool allow_texture_gc = true);
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -185,24 +227,19 @@ public:
     /// Synchronizes all buffers in the specified range.
     void SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is_written = false);
 
-    /// Runs the garbage collector.
-    void RunGarbageCollector();
+    /// Advances the eviction epoch. Called once per guest submission by the rasterizer.
+    void AdvanceGcEpoch();
+
+    /// Reclaims CPU-authoritative buffers without waiting for GPU readbacks.
+    [[nodiscard]] GcResult RunGarbageCollector(GcBudget& budget);
+
+    /// Installs the rasterizer-owned shared collector used by pressured allocations.
+    void SetAllocationReclaimCallback(std::function<void(u64, u64, bool, bool)> callback) {
+        allocation_reclaim_callback = std::move(callback);
+    }
 
     /// Notifies memory tracker of GPU modified ranges from the last CPU fence.
     void CommitPendingGpuRanges();
-    void EnqueueForGc(std::function<void()> fn);
-    void RunGarbageCollectorAsync();
-    mutable std::mutex gc_mutex;
-    std::queue<std::function<void()>> gc_queue;
-    u64 GetTriggerGcMemory() const {
-        return trigger_gc_memory;
-    }
-    u64 GetPressureGcMemory() const {
-        return pressure_gc_memory;
-    }
-    u64 GetCriticalGcMemory() const {
-        return critical_gc_memory;
-    }
 
 private:
     template <typename Func>
@@ -220,11 +257,14 @@ private:
 
     template <bool async>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write);
-    [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
+    [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size, u64 used_memory,
+                                                u64 total_budget);
 
-    void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
+    void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id);
 
-    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size);
+    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size, bool allow_texture_gc = true);
+
+    void ReclaimForAllocation(u64 allocation_size, bool force, bool allow_texture_gc);
 
     void Register(BufferId buffer_id);
 
@@ -243,9 +283,12 @@ private:
 
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
-    void TouchBuffer(const Buffer& buffer);
+    void MarkBufferUsed(Buffer& buffer);
 
-    void DeleteBuffer(BufferId buffer_id);
+    void TouchBuffer(Buffer& buffer);
+
+    void DeleteBuffer(BufferId buffer_id, GcResult* gc_result = nullptr,
+                      BufferRetirementReason reason = BufferRetirementReason::CacheReplacement);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -261,11 +304,10 @@ private:
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;
-    u64 total_used_memory = 0;
-    u64 trigger_gc_memory = 0;
-    u64 pressure_gc_memory = 0;
-    u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
+    u64 pressure_allocation_log_count{};
+    u64 replacement_chain_tick{};
+    u64 replacement_chain_deferred_bytes{};
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     RangeSet gpu_modified_ranges_pending;
@@ -282,6 +324,7 @@ private:
     tsl::robin_map<BufferId, BufferCopies> preemptive_copies;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    std::function<void(u64, u64, bool, bool)> allocation_reclaim_callback;
 };
 
 } // namespace VideoCore

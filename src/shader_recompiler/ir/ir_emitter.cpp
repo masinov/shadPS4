@@ -16,8 +16,8 @@ namespace {
                                    std::source_location loc = std::source_location::current()) {
     const std::string functionName = loc.function_name();
     const int lineNumber = loc.line();
-    // UNREACHABLE_MSG("Invalid type = {}, functionName = {}, line = {}", u32(type), functionName,
-    //                 lineNumber);
+    UNREACHABLE_MSG("Invalid type = {}, functionName = {}, line = {}", u32(type), functionName,
+                    lineNumber);
 }
 } // Anonymous namespace
 

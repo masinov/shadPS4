@@ -112,8 +112,10 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         .instance = instance.GetInstance(),
         .physical_device = instance.GetPhysicalDevice(),
         .device = instance.GetDevice(),
-        .queue_family = instance.GetPresentQueueFamilyIndex(),
-        .queue = instance.GetPresentQueue(),
+        .queue_family = instance.GetGraphicsQueueFamilyIndex(),
+        // ImGui uploads submit and wait on this queue from Scheduler::SubmitExecution, i.e. under
+        // the graphics queue mutex; the presentation queue may be a different VkQueue.
+        .queue = instance.GetGraphicsQueue(),
         .image_count = image_count,
         .min_allocation_size = 1024 * 1024,
         .pipeline_rendering_create_info{
@@ -147,13 +149,15 @@ void OnSurfaceFormatChange(vk::Format surface_format) {
 }
 
 void Shutdown(const vk::Device& device) {
+    // The texture worker records Vulkan upload work, so it must be stopped and joined before the
+    // device-idle boundary and backend destruction.
+    TextureManager::StopWorker();
+
     auto result = device.waitIdle();
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on shutdown: {}",
                     vk::to_string(result));
     }
-
-    TextureManager::StopWorker();
 
     const ImGuiIO& io = GetIO();
     const auto ini_filename = (void*)io.IniFilename;

@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <string_view>
+
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -11,6 +17,7 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+std::atomic<SubmitCriticalPhase> Scheduler::submit_critical_phase{SubmitCriticalPhase::None};
 
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
@@ -116,13 +123,11 @@ void Scheduler::Wait(u64 tick) {
     master_semaphore.Wait(tick);
 }
 
-void Scheduler::PopPendingOperations() {
-    std::unique_lock lk(priority_pending_ops_mutex);
-    master_semaphore.Refresh();
-    while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        pending_ops.front().callback();
-        pending_ops.pop();
+u32 Scheduler::PopPendingOperations(bool refresh_timeline) {
+    if (refresh_timeline) {
+        master_semaphore.Refresh();
     }
+    return pending_ops.Drain([this](u64 gpu_tick) { return master_semaphore.IsFree(gpu_tick); });
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
@@ -132,6 +137,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    instance.InsertCheckpoint(current_cmdbuf, GpuCheckpoint::CommandBufferBegin);
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -147,7 +153,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
+    const auto submit_start = std::chrono::steady_clock::now();
     const u64 signal_value = master_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -159,15 +165,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     EndRendering();
+    instance.InsertCheckpoint(current_cmdbuf, GpuCheckpoint::CommandBufferEnd);
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
-
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -180,22 +182,66 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pNext = &timeline_si,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = info.wait_stage_masks.data(),
         .commandBufferCount = 1U,
         .pCommandBuffers = &current_cmdbuf,
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    const auto prepare_end = std::chrono::steady_clock::now();
+    const auto lock_start = std::chrono::steady_clock::now();
+    vk::Result submit_result;
+    std::chrono::steady_clock::time_point lock_end;
+    std::chrono::steady_clock::time_point imgui_end;
+    std::chrono::steady_clock::time_point queue_end;
+    SubmitCriticalPhase contended_phase = SubmitCriticalPhase::None;
+    {
+        // Vulkan queues require external synchronization. ImGui texture upload also submits to and
+        // waits on this queue, so it belongs in the same critical section. Command-buffer
+        // preparation, timeline maintenance, and arbitrary deferred callbacks are scheduler-local
+        // and must not hold this global lock: callbacks are allowed to submit recursively.
+        SubmitLock lk{SubmitCriticalPhase::ImGui};
+        contended_phase = lk.ContendedPhase();
+        lock_end = std::chrono::steady_clock::now();
+        ImGui::Core::TextureManager::Submit();
+        imgui_end = std::chrono::steady_clock::now();
+        SetSubmitCriticalPhase(SubmitCriticalPhase::QueueSubmit);
+        submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        queue_end = std::chrono::steady_clock::now();
+    }
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceLoss("graphics queue submission");
+    }
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Failed to submit command buffer: {}",
+               vk::to_string(submit_result));
 
     master_semaphore.Refresh();
+    const auto refresh_end = std::chrono::steady_clock::now();
     AllocateWorkerCommandBuffers();
+    const auto allocate_end = std::chrono::steady_clock::now();
 
-    // Apply pending operations
-    PopPendingOperations();
+    // Apply pending operations using the timeline value sampled immediately above. Refreshing it
+    // again here would issue a duplicate driver query on every submission.
+    const u32 executed_pending_operations = PopPendingOperations(false);
+    const auto pending_end = std::chrono::steady_clock::now();
+
+    const auto elapsed_ms = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+    };
+    const auto total_ms = elapsed_ms(submit_start, pending_end);
+    if (total_ms >= 100) {
+        LOG_WARNING(Render_Vulkan,
+                    "Slow scheduler submission: total={} ms, prepare={} ms, submit_lock={} ms, "
+                    "contended_phase={}, imgui_submit={} ms, queue_submit={} ms, "
+                    "timeline_refresh={} ms, command_buffer={} ms, pending_ops={} ms "
+                    "({} callbacks)",
+                    total_ms, elapsed_ms(submit_start, prepare_end),
+                    elapsed_ms(lock_start, lock_end), SubmitCriticalPhaseName(contended_phase),
+                    elapsed_ms(lock_end, imgui_end), elapsed_ms(imgui_end, queue_end),
+                    elapsed_ms(queue_end, refresh_end), elapsed_ms(refresh_end, allocate_end),
+                    elapsed_ms(allocate_end, pending_end), executed_pending_operations);
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

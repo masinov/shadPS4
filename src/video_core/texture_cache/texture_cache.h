@@ -8,12 +8,12 @@
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
-#include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/memory_gc.h"
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -35,11 +35,6 @@ class BufferCache;
 class PageManager;
 
 class TextureCache {
-    // Default values for garbage collection
-    static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
-    static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
-    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
-
 public:
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -50,6 +45,18 @@ public:
         static constexpr size_t PageBits = 20;
     };
     using PageTable = MultiLevelPageTable<Traits>;
+
+    struct DebugPageState {
+        u32 first_tracked_image{Common::SlotId::INVALID_INDEX};
+        VAddr image_begin{};
+        VAddr image_end{};
+        VAddr track_begin{};
+        VAddr track_end{};
+        u32 registered_images{};
+        u32 tracked_images{};
+        u32 cpu_dirty_images{};
+        u32 gpu_modified_images{};
+    };
 
 public:
     enum class BindingType : u32 {
@@ -99,6 +106,9 @@ public:
     ///                          exclude the producer storage image from invalidation).
     void InvalidateMemory(VAddr addr, size_t size, ImageId exclude_image_id = {});
 
+    /// Returns non-mutating image ownership state for repeated-fault diagnostics.
+    [[nodiscard]] DebugPageState GetDebugPageState(VAddr addr);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
@@ -112,6 +122,7 @@ public:
 
     /// Add an image to the download queue for guest memory writeback on next submit.
     void AddDownload(ImageId image_id) {
+        std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
 
@@ -226,12 +237,11 @@ public:
         return false;
     }
 
-    /// Runs the garbage collector.
-    void RunGarbageCollector();
+    /// Reclaims CPU-authoritative images without waiting for GPU readbacks.
+    /// Advances the eviction epoch. Called once per guest submission by the rasterizer.
+    void AdvanceGcEpoch();
 
-    void EnqueueForGc(std::function<void()> fn);
-
-    void RunGarbageCollectorAsync();
+    [[nodiscard]] GcResult RunGarbageCollector(GcBudget& budget);
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -272,17 +282,6 @@ public:
         for (const ImageId image_id : images) {
             slot_images[image_id].flags &= ~ImageFlagBits::Picked;
         }
-    }
-    mutable std::mutex gc_mutex;
-    std::queue<std::function<void()>> gc_queue;
-    u64 GetTriggerGcMemory() const {
-        return trigger_gc_memory;
-    }
-    u64 GetPressureGcMemory() const {
-        return pressure_gc_memory;
-    }
-    u64 GetCriticalGcMemory() const {
-        return critical_gc_memory;
     }
 
 private:
@@ -330,15 +329,15 @@ private:
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
-    void DeleteImage(ImageId image_id);
+    void DeleteImage(ImageId image_id, GcResult* gc_result = nullptr);
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image);
 
-    void FreeImage(ImageId image_id) {
+    void FreeImage(ImageId image_id, GcResult* gc_result = nullptr) {
         UntrackImage(image_id);
         UnregisterImage(image_id);
-        DeleteImage(image_id);
+        DeleteImage(image_id, gc_result);
     }
 
 private:
@@ -353,10 +352,6 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
-    u64 total_used_memory = 0;
-    u64 trigger_gc_memory = 0;
-    u64 pressure_gc_memory = 0;
-    u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     bool readback_linear_images;

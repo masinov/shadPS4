@@ -59,7 +59,9 @@ public:
             std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         while (iterator) {
-            if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
+            // "Below" is strict. In particular, an item touched in the current GC epoch must not
+            // be eligible when the cutoff is that same epoch.
+            if (iterator->tick >= tick) {
                 return;
             }
             Item* next = iterator->next;

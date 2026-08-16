@@ -109,6 +109,7 @@ struct ShaderDump {
         : name{std::move(other.name)}, l_stage(other.l_stage), module{std::move(other.module)},
           spv{std::move(other.spv)}, isa{std::move(other.isa)},
           patch_spv{std::move(other.patch_spv)}, patch_source{std::move(other.patch_source)},
+          loaded_data{other.loaded_data}, is_patched{other.is_patched},
           cache_spv_disasm{std::move(other.cache_spv_disasm)},
           cache_isa_disasm{std::move(other.cache_isa_disasm)},
           cache_patch_disasm{std::move(other.cache_patch_disasm)} {}
@@ -123,6 +124,8 @@ struct ShaderDump {
         isa = std::move(other.isa);
         patch_spv = std::move(other.patch_spv);
         patch_source = std::move(other.patch_source);
+        loaded_data = other.loaded_data;
+        is_patched = other.is_patched;
         cache_spv_disasm = std::move(other.cache_spv_disasm);
         cache_isa_disasm = std::move(other.cache_isa_disasm);
         cache_patch_disasm = std::move(other.cache_patch_disasm);

@@ -9,6 +9,7 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/gpu_diagnostic_tracker.h"
 #include "video_core/renderer_vulkan/render_target_sync.h"
 #include "video_core/renderer_vulkan/storage_image_sync.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -67,7 +68,7 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size);
+    bool InvalidateMemory(VAddr addr, u64 size, bool diagnose_repeated_fault = false);
     bool ReadMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
@@ -101,6 +102,11 @@ public:
     }
 
 private:
+    [[nodiscard]] std::pair<VideoCore::GcResult, VideoCore::GcResult> RunSharedGarbageCollector(
+        VideoCore::GcBudget& budget);
+    void ReclaimForAllocation(u64 reclaim_target, u64 allocation_size, bool forced,
+                              bool allow_texture_gc);
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -120,6 +126,9 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    [[nodiscard]] GpuCheckpointContext MakeCheckpointContext(const Pipeline& pipeline,
+                                                             u64 pipeline_hash, bool indexed,
+                                                             bool predicated) const;
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -159,6 +168,10 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    boost::container::static_vector<GpuResourceContext, Shader::NUM_BUFFERS>
+        checkpoint_writable_buffers;
+    boost::container::static_vector<GpuResourceContext, Shader::NUM_IMAGES>
+        checkpoint_writable_images;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
@@ -171,6 +184,12 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+    u32 gc_submit_count{};
+    u32 gc_log_count{};
+    u32 memory_allocator_frame_index{};
+    u64 allocation_gc_pass_count{};
+    bool gc_texture_first{true};
+    VideoCore::GcPressure gc_pressure{VideoCore::GcPressure::None};
     PredicationManager predication;
 };
 

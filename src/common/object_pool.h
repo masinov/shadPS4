@@ -21,7 +21,11 @@ public:
     template <typename... Args>
         requires std::is_constructible_v<T, Args...>
     [[nodiscard]] T* Create(Args&&... args) {
-        return std::construct_at(Memory(), std::forward<Args>(args)...);
+        Chunk* const chunk{FreeChunk()};
+        T* const object{&chunk->storage[chunk->used_objects].object};
+        T* const result{std::construct_at(object, std::forward<Args>(args)...)};
+        ++chunk->used_objects;
+        return result;
     }
 
     void ReleaseContents() {
@@ -77,7 +81,11 @@ private:
         }
 
         void Release() {
-            std::destroy_n(storage.get(), used_objects);
+            // Storage has an intentionally empty destructor because the active union member is
+            // managed manually. Destroying Storage itself therefore does not destroy T.
+            for (size_t i = 0; i < used_objects; ++i) {
+                std::destroy_at(&storage[i].object);
+            }
             used_objects = 0;
         }
 
@@ -85,11 +93,6 @@ private:
         size_t num_objects{};
         std::unique_ptr<Storage[]> storage;
     };
-
-    [[nodiscard]] T* Memory() {
-        Chunk* const chunk{FreeChunk()};
-        return &chunk->storage[chunk->used_objects++].object;
-    }
 
     [[nodiscard]] Chunk* FreeChunk() {
         if (node->used_objects != node->num_objects) {

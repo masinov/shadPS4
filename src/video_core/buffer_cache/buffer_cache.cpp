@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <limits>
+#include <numeric>
+#include <vector>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/memory_patcher.h"
@@ -11,6 +15,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/stream_buffer_policy.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -44,40 +49,24 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
-
-    // Set up garbage collection parameters
-    if (!instance.CanReportMemoryUsage()) {
-        trigger_gc_memory = DEFAULT_TRIGGER_GC_MEMORY;
-        critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
-        return;
-    }
-
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    trigger_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_TRIGGER_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
 }
 
 BufferCache::~BufferCache() = default;
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool download) {
+    // Readback-disabled mode never needs a live host buffer to make guest memory authoritative.
+    // Always update an existing tracker region so a buffer that was removed from buffer_ranges
+    // cannot leave behind an unserviceable write watcher. IteratePages<false> makes this a cheap
+    // no-op when the tracker has never seen the range.
+    if (Config::readbackSpeed() == Config::ReadbackSpeed::Disable) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        return;
+    }
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
-    if (Config::readbackSpeed() != Config::ReadbackSpeed::Disable) {
-        memory_tracker->InvalidateRegion(
-            device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
-    } else {
-        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-    }
+    memory_tracker->InvalidateRegion(
+        device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
@@ -118,6 +107,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         preemptive_downloads.Subtract(page_addr, PageManager::PAGE_SIZE);
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     } else {
+        MarkBufferUsed(buffer);
         const auto [download, offset] = download_buffer.Map(total_size_bytes);
         for (auto& copy : copies) {
             // Modify copies to have the staging offset in mind
@@ -126,6 +116,12 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         download_buffer.Commit();
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
+        instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferDownload,
+                                  Vulkan::GpuCheckpointContext{
+                                      .source_guest_address = device_addr,
+                                      .transfer_size = total_size_bytes,
+                                      .source_generation = buffer.address_generation,
+                                  });
         cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
         const VAddr buffer_addr = buffer.CpuAddr();
         auto write_data = [this, copies = std::move(copies), download, offset, buffer_addr,
@@ -201,6 +197,12 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferDownload,
+                              Vulkan::GpuCheckpointContext{
+                                  .source_guest_address = buffer->CpuAddr(),
+                                  .transfer_size = total_size_bytes,
+                                  .source_generation = buffer->address_generation,
+                              });
     cmdbuf.copyBuffer(buffer->Handle(), download_buffer.Handle(), copies);
     scheduler.DeferOperation([this, buf_addr = buffer->CpuAddr(), copies = std::move(copies),
                               download, download_offset, image_addr, image_size]() {
@@ -214,26 +216,19 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     });
 }
 
-void BufferCache::BindVertexBuffers(
+BufferCache::VertexBufferBinding BufferCache::PrepareVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     const auto& regs = liverpool->regs;
-    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexBufferBinding binding{};
     Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+    pipeline.GetVertexInputs(binding.attributes, binding.bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
-    if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
-    }
-
-    if (bindings.empty()) {
+    if (binding.bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
-        return;
+        return binding;
     }
 
     struct BufferRange {
@@ -287,11 +282,7 @@ void BufferCache::BindVertexBuffers(
         }
     }
 
-    // Bind vertex buffers
-    Vulkan::VertexInputs<vk::Buffer> host_buffers;
-    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
-    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
-    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    // Resolve host bindings for every guest vertex buffer.
     for (const auto& buffer : guest_buffers) {
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
             const auto host_buffer_info =
@@ -300,28 +291,40 @@ void BufferCache::BindVertexBuffers(
                            buffer.base_address < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
-                                   host_buffer_info->base_address);
+            binding.host_buffers.emplace_back(host_buffer_info->vk_buffer);
+            binding.host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+                                           host_buffer_info->base_address);
         } else {
-            host_buffers.emplace_back(VK_NULL_HANDLE);
-            host_offsets.push_back(0);
+            binding.host_buffers.emplace_back(VK_NULL_HANDLE);
+            binding.host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
+        binding.host_sizes.push_back(buffer.GetSize());
+        binding.host_strides.push_back(buffer.GetStride());
     }
+    return binding;
+}
 
+void BufferCache::BindVertexBuffers(const VertexBufferBinding& binding) {
     const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+        // Update current vertex inputs.
+        cmdbuf.setVertexInputEXT(binding.bindings, binding.attributes);
+    }
+    if (binding.bindings.empty()) {
+        return;
+    }
+    const auto num_buffers = static_cast<u32>(binding.host_buffers.size());
+    if (instance.IsVertexInputDynamicState()) {
+        cmdbuf.bindVertexBuffers(0, num_buffers, binding.host_buffers.data(),
+                                 binding.host_offsets.data());
     } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
+        cmdbuf.bindVertexBuffers2(0, num_buffers, binding.host_buffers.data(),
+                                  binding.host_offsets.data(), binding.host_sizes.data(),
+                                  binding.host_strides.data());
     }
 }
 
-void BufferCache::BindIndexBuffer(
+BufferCache::IndexBufferBinding BufferCache::PrepareIndexBuffer(
     u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     const auto& regs = liverpool->regs;
 
@@ -332,7 +335,7 @@ void BufferCache::BindIndexBuffer(
     const VAddr index_address =
         regs.index_base_address.Address<VAddr>() + index_offset * index_size;
 
-    // Bind index buffer.
+    // Resolve the index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size);
     if (IsRegionGpuModified(index_address, index_buffer_size)) {
@@ -341,8 +344,16 @@ void BufferCache::BindIndexBuffer(
             barriers.emplace_back(*barrier);
         }
     }
+    return IndexBufferBinding{
+        .buffer = vk_buffer->Handle(),
+        .offset = offset,
+        .index_type = index_type,
+    };
+}
+
+void BufferCache::BindIndexBuffer(const IndexBufferBinding& binding) {
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    cmdbuf.bindIndexBuffer(binding.buffer, binding.offset, binding.index_type);
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -351,8 +362,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     if (!is_gds) {
         texture_cache.ClearMeta(address);
 
-        const bool use_alt_gpu_check = MemoryPatcher::g_game_serial == "CUSA00093" ||
-                                       MemoryPatcher::g_game_serial == "CUSA00003";
+        const bool use_alt_gpu_check = MemoryPatcher::Quirks().defer_write_protect;
 
         const bool gpu_modified = use_alt_gpu_check
                                       ? IsRegionGpuModified(address, num_bytes)
@@ -440,6 +450,14 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         .bufferMemoryBarrierCount = 2,
         .pBufferMemoryBarriers = buf_barriers_before,
     });
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferCopy,
+                              Vulkan::GpuCheckpointContext{
+                                  .source_guest_address = src,
+                                  .destination_guest_address = dst,
+                                  .transfer_size = num_bytes,
+                                  .source_generation = src_buffer.address_generation,
+                                  .destination_generation = dst_buffer.address_generation,
+                              });
     cmdbuf.copyBuffer(src_buffer.Handle(), dst_buffer.Handle(), region);
     const vk::BufferMemoryBarrier2 buf_barriers_after[2] = {
         {
@@ -475,6 +493,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
     const bool is_texel_buffer = (flags & ObtainBufferFlags::IsTexelBuffer) != ObtainBufferFlags{};
     const bool skip_stream_buffer =
         (flags & ObtainBufferFlags::IgnoreStreamBuffer) != ObtainBufferFlags{};
+    const bool allow_texture_gc =
+        (flags & ObtainBufferFlags::AvoidTextureGc) == ObtainBufferFlags{};
 
     if (!is_written && !skip_stream_buffer && size <= CACHING_PAGESIZE &&
         !IsRegionGpuModified(device_addr, size) && IsRegionCpuModified(device_addr, size)) {
@@ -484,16 +504,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
     }
 
     if (IsBufferInvalid(buffer_id)) {
-        buffer_id = FindBuffer(device_addr, size);
+        buffer_id = FindBuffer(device_addr, size, allow_texture_gc);
     }
 
     Buffer& buffer = slot_buffers[buffer_id];
 
-    const bool defer_write_protect =
-        MemoryPatcher::g_game_serial == "CUSA00093" || MemoryPatcher::g_game_serial == "CUSA00003";
+    const bool defer_write_protect = MemoryPatcher::Quirks().defer_write_protect;
 
     SynchronizeBuffer(buffer, device_addr, size, is_written && !defer_write_protect,
                       is_texel_buffer);
+    TouchBuffer(buffer);
 
     if (is_written) {
         if (defer_write_protect) {
@@ -512,12 +532,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
             SynchronizeBuffer(buffer, gpu_addr, size, false, false);
+            TouchBuffer(buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
         }
     }
     // If some buffer within was GPU modified create a full buffer to avoid losing GPU data.
     if (IsRegionGpuModified(gpu_addr, size)) {
-        return ObtainBuffer(gpu_addr, size);
+        return ObtainBuffer(gpu_addr, size, ObtainBufferFlags::AvoidTextureGc);
     }
     // In all other cases, just do a CPU copy to the staging buffer.
     const auto [data, offset] = staging_buffer.Map(size, 16);
@@ -529,6 +550,28 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
     // Check if we are missing some edge case here
     return buffer_ranges.Intersects(addr, size);
+}
+
+BufferCache::DebugPageState BufferCache::GetDebugPageState(VAddr addr) {
+    const auto tracker_state = memory_tracker->GetDebugPageState(addr);
+    const VAddr page_addr = PageManager::GetPageAddr(addr);
+    DebugPageState result{
+        .registered = IsRegionRegistered(addr, 1),
+        .tracker_exists = tracker_state.region_exists,
+        .cpu_modified = tracker_state.cpu_modified,
+        .gpu_modified = tracker_state.gpu_modified,
+        .gpu_pending = gpu_modified_ranges_pending.Intersects(page_addr, PageManager::PAGE_SIZE),
+    };
+    if (result.registered) {
+        const BufferId buffer_id = page_table[addr >> CACHING_PAGEBITS].buffer_id;
+        if (!IsBufferInvalid(buffer_id)) {
+            const Buffer& buffer = slot_buffers[buffer_id];
+            result.buffer_id = buffer_id.index;
+            result.buffer_begin = buffer.CpuAddr();
+            result.buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
+        }
+    }
+    return result;
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
@@ -556,51 +599,41 @@ void BufferCache::MarkRegionAsCpuModified(VAddr addr, size_t size) {
     memory_tracker->MarkRegionAsCpuModified(addr, size);
 }
 
-BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
+BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size, bool allow_texture_gc) {
     ASSERT(device_addr != 0);
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {
-        return CreateBuffer(device_addr, size);
+        return CreateBuffer(device_addr, size, allow_texture_gc);
     }
     const Buffer& buffer = slot_buffers[buffer_id];
     if (buffer.IsInBounds(device_addr, size)) {
         return buffer_id;
     }
-    return CreateBuffer(device_addr, size);
+    return CreateBuffer(device_addr, size, allow_texture_gc);
 }
 
-BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
-    static constexpr int STREAM_LEAP_THRESHOLD = 16;
+BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size,
+                                                        u64 used_memory, u64 total_budget) {
     boost::container::small_vector<BufferId, 16> overlap_ids;
     VAddr begin = device_addr;
     VAddr end = device_addr + wanted_size;
+    const VAddr requested_begin = begin;
+    const VAddr requested_end = end;
+    VAddr overlap_begin = std::numeric_limits<VAddr>::max();
+    VAddr overlap_span_end = 0;
     int stream_score = 0;
     bool has_stream_leap = false;
-    const auto expand_begin = [&](VAddr add_value) {
-        static constexpr VAddr min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
-        if (add_value > begin - min_page) {
-            begin = min_page;
-            device_addr = DEVICE_PAGESIZE;
-            return;
-        }
-        begin -= add_value;
-        device_addr = begin - CACHING_PAGESIZE;
-    };
-    const auto expand_end = [&](VAddr add_value) {
-        static constexpr VAddr max_page = 1ULL << MemoryTracker::MAX_CPU_PAGE_BITS;
-        if (add_value > max_page - end) {
-            end = max_page;
-            return;
-        }
-        end += add_value;
-    };
     if (begin == 0) {
         return OverlapResult{
             .ids = std::move(overlap_ids),
             .begin = begin,
             .end = end,
+            .stream_score = 0,
             .has_stream_leap = has_stream_leap,
+            .stream_growth_suppressed = false,
+            .desired_stream_growth = 0,
+            .speculative_bytes = 0,
         };
     }
     for (; device_addr >> CACHING_PAGEBITS < Common::DivCeil(end, CACHING_PAGESIZE);
@@ -616,43 +649,91 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         overlap_ids.push_back(overlap_id);
         overlap.is_picked = true;
         const VAddr overlap_device_addr = overlap.CpuAddr();
-        const bool expands_left = overlap_device_addr < begin;
-        if (expands_left) {
+        overlap_begin = std::min(overlap_begin, overlap_device_addr);
+        if (overlap_device_addr < begin) {
             begin = overlap_device_addr;
         }
-        const VAddr overlap_end = overlap_device_addr + overlap.SizeBytes();
-        const bool expands_right = overlap_end > end;
-        if (overlap_end > end) {
-            end = overlap_end;
+        const VAddr overlap_buffer_end = overlap_device_addr + overlap.SizeBytes();
+        if (overlap_buffer_end > end) {
+            end = overlap_buffer_end;
         }
-        stream_score += overlap.StreamScore();
-        if (stream_score > STREAM_LEAP_THRESHOLD && !has_stream_leap) {
-            // When this memory region has been joined a bunch of times, we assume it's being used
-            // as a stream buffer. Increase the size to skip constantly recreating buffers.
-            has_stream_leap = true;
-            if (expands_right) {
-                expand_end(CACHING_PAGESIZE * 128);
+        overlap_span_end = std::max(overlap_span_end, overlap_buffer_end);
+        stream_score = AccumulateStreamScore(stream_score, overlap.StreamScore());
+    }
+
+    // Padding must happen after natural overlap closure. Growing `end` inside the loop makes the
+    // overlap scan consume neighboring buffers merely because they occupy reserved capacity,
+    // turning a small streaming step into a much larger merge and copy.
+    const VAddr natural_begin = begin;
+    const VAddr natural_end = end;
+    const bool stream_growth_candidate = stream_score > StreamLeapThreshold;
+    const auto growth =
+        stream_growth_candidate
+            ? DetermineStreamGrowth(requested_begin, requested_end, overlap_begin, overlap_span_end)
+            : StreamGrowthDirections{};
+    const VAddr natural_size = natural_end - natural_begin;
+    const VAddr right_growth =
+        growth.right ? DetermineStreamGrowthDistance(wanted_size, requested_end - overlap_span_end,
+                                                     natural_size)
+                     : 0;
+    const VAddr left_growth =
+        growth.left ? DetermineStreamGrowthDistance(wanted_size, overlap_begin - requested_begin,
+                                                    natural_size)
+                    : 0;
+    const u64 desired_stream_growth = left_growth + right_growth;
+    const bool stream_growth_suppressed =
+        stream_growth_candidate && desired_stream_growth != 0 &&
+        !ShouldReserveStreamGrowth(used_memory, total_budget, natural_end - natural_begin,
+                                   desired_stream_growth);
+    has_stream_leap =
+        stream_growth_candidate && desired_stream_growth != 0 && !stream_growth_suppressed;
+    if (has_stream_leap) {
+        static constexpr VAddr MinAddress = CACHING_PAGESIZE + DEVICE_PAGESIZE;
+        static constexpr VAddr MaxAddress = 1ULL << MemoryTracker::MAX_CPU_PAGE_BITS;
+
+        if (growth.right) {
+            VAddr padded_end = GrowStreamEnd(end, right_growth, MaxAddress);
+            padded_end = Common::AlignDown(padded_end, CACHING_PAGESIZE);
+            // Spare capacity may use empty pages but must not proactively absorb another buffer.
+            for (VAddr page_addr = end; page_addr < padded_end; page_addr += CACHING_PAGESIZE) {
+                if (page_table[page_addr >> CACHING_PAGEBITS].buffer_id) {
+                    padded_end = page_addr;
+                    break;
+                }
             }
-            if (expands_left) {
-                expand_begin(CACHING_PAGESIZE * 128);
+            end = padded_end;
+        }
+        if (growth.left) {
+            VAddr padded_begin = GrowStreamBegin(begin, left_growth, MinAddress);
+            padded_begin = Common::AlignUp(padded_begin, CACHING_PAGESIZE);
+            for (VAddr page_addr = begin; page_addr > padded_begin;) {
+                page_addr -= CACHING_PAGESIZE;
+                if (page_table[page_addr >> CACHING_PAGEBITS].buffer_id) {
+                    padded_begin = page_addr + CACHING_PAGESIZE;
+                    break;
+                }
             }
+            begin = padded_begin;
         }
     }
+    const int replacement_stream_score =
+        ReplacementStreamScore(stream_score, overlap_ids.size(), has_stream_leap);
+    const u64 speculative_bytes = (natural_begin - begin) + (end - natural_end);
     return OverlapResult{
         .ids = std::move(overlap_ids),
         .begin = begin,
         .end = end,
+        .stream_score = replacement_stream_score,
         .has_stream_leap = has_stream_leap,
+        .stream_growth_suppressed = stream_growth_suppressed,
+        .desired_stream_growth = desired_stream_growth,
+        .speculative_bytes = speculative_bytes,
     };
 }
 
-void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
-                              bool accumulate_stream_score) {
+void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
-    if (accumulate_stream_score) {
-        new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
-    }
     const size_t dst_base_offset = overlap.CpuAddr() - new_buffer.CpuAddr();
     const vk::BufferCopy copy = {
         .srcOffset = 0,
@@ -678,7 +759,20 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .pBufferMemoryBarriers = pre_barriers.data(),
     });
 
+    instance.InsertCheckpoint(
+        cmdbuf, Vulkan::GpuCheckpoint::BufferMerge,
+        Vulkan::GpuCheckpointContext{
+            .source_guest_address = overlap.CpuAddr(),
+            .destination_guest_address = new_buffer.CpuAddr() + dst_base_offset,
+            .transfer_size = copy.size,
+            .source_generation = overlap.address_generation,
+            .destination_generation = new_buffer.address_generation,
+        });
     cmdbuf.copyBuffer(overlap.Handle(), new_buffer.Handle(), copy);
+    // Both allocations are referenced by this command buffer. The replacement is not registered
+    // in the LRU yet, so record lifetime independently of eviction recency.
+    MarkBufferUsed(overlap);
+    MarkBufferUsed(new_buffer);
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> post_barriers{};
     if (auto src_barrier =
@@ -699,21 +793,113 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allow_texture_gc) {
+    const VAddr requested_addr = device_addr;
+    const u32 requested_size = wanted_size;
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    u64 used_memory = instance.GetDeviceMemoryUsage();
+    const u64 total_budget = instance.GetTotalMemoryBudget();
+    const OverlapResult overlap =
+        ResolveOverlaps(device_addr, wanted_size, used_memory, total_budget);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+
+    u64 overlap_bytes{};
+    u64 largest_overlap{};
+    for (const BufferId overlap_id : overlap.ids) {
+        Buffer& overlap_buffer = slot_buffers[overlap_id];
+        // Protect the selected source across both the optional chain-breaking submission and the
+        // allocation reclaim which follows it. JoinOverlap records the new tick after a flush.
+        TouchBuffer(overlap_buffer);
+        overlap_bytes += overlap_buffer.SizeBytes();
+        largest_overlap = std::max<u64>(largest_overlap, overlap_buffer.SizeBytes());
+    }
+
+    // A replacement's old allocations remain alive until the command buffer containing their
+    // copies completes. Advance the timeline before one recording tick consumes the allocator's
+    // entire safety margin with old versions of the same streaming range.
+    const u64 current_tick = scheduler.CurrentTick();
+    if (replacement_chain_tick != current_tick) {
+        replacement_chain_tick = current_tick;
+        replacement_chain_deferred_bytes = 0;
+    }
+    // Every replaced allocation in this tick stays resident until the tick completes, whatever
+    // range it belonged to. Bound that total by submitting once it would exceed the allocator's
+    // headroom; a submission costs far less than the emergency reclaim it prevents.
+    const u64 chain_deferred_before = replacement_chain_deferred_bytes;
+    const bool chain_advanced =
+        ShouldAdvanceReplacementChain(chain_deferred_before, overlap_bytes, total_budget);
+    if (chain_advanced) {
+        scheduler.Flush();
+        replacement_chain_tick = scheduler.CurrentTick();
+        replacement_chain_deferred_bytes = 0;
+        used_memory = instance.GetDeviceMemoryUsage();
+    }
+
+    const bool under_pressure =
+        AllocationReclaimTarget(used_memory, total_budget, size, false) != 0;
+    const bool sample_pressure =
+        under_pressure && ShouldLogDiagnosticSample(++pressure_allocation_log_count);
+    if (size >= 64_MB || sample_pressure || chain_advanced) {
+        LOG_INFO(Render_Vulkan,
+                 "Cache buffer allocation: request=[{:#x},{:#x}) ({} bytes), "
+                 "resolved=[{:#x},{:#x}) ({} bytes), overlaps={} ({} bytes, largest {}), "
+                 "stream_leap={}, usage={} MiB, budget={} MiB, pressure_sample={}, "
+                 "stream_suppressed={}, desired_growth={} bytes, speculative={} bytes, "
+                 "chain_advanced={}, tick_deferred={} bytes",
+                 requested_addr, requested_addr + requested_size, requested_size, overlap.begin,
+                 overlap.end, size, overlap.ids.size(), overlap_bytes, largest_overlap,
+                 overlap.has_stream_leap, used_memory / 1_MB, total_budget / 1_MB, sample_pressure,
+                 overlap.stream_growth_suppressed, overlap.desired_stream_growth,
+                 overlap.speculative_bytes, chain_advanced, chain_deferred_before);
+    }
+
+    ReclaimForAllocation(size, false, allow_texture_gc);
+    std::function<void()> allocation_failure_callback;
+    if (allocation_reclaim_callback) {
+        allocation_failure_callback = [this, size, allow_texture_gc] {
+            ReclaimForAllocation(size, true, allow_texture_gc);
+        };
+    }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
+                            allocation_failure_callback);
     auto& new_buffer = slot_buffers[new_buffer_id];
+    // The allocation was created to satisfy work being recorded now. Initializing its lifetime
+    // here prevents a zero last-use tick from ever being interpreted as completed by a later
+    // allocation-driven collection in the same command buffer.
+    MarkBufferUsed(new_buffer);
     for (const BufferId overlap_id : overlap.ids) {
-        JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+        JoinOverlap(new_buffer_id, overlap_id);
     }
+    const u64 replacement_tick = scheduler.CurrentTick();
+    if (replacement_chain_tick != replacement_tick) {
+        replacement_chain_tick = replacement_tick;
+        replacement_chain_deferred_bytes = 0;
+    }
+    replacement_chain_deferred_bytes =
+        overlap_bytes > std::numeric_limits<u64>::max() - replacement_chain_deferred_bytes
+            ? std::numeric_limits<u64>::max()
+            : replacement_chain_deferred_bytes + overlap_bytes;
+    new_buffer.IncreaseStreamScore(overlap.stream_score);
     Register(new_buffer_id);
     return new_buffer_id;
+}
+
+void BufferCache::ReclaimForAllocation(u64 allocation_size, bool force, bool allow_texture_gc) {
+    if (!allocation_reclaim_callback) {
+        return;
+    }
+    const u64 used_memory = instance.GetDeviceMemoryUsage();
+    const u64 total_budget = instance.GetTotalMemoryBudget();
+    const u64 reclaim_target =
+        AllocationReclaimTarget(used_memory, total_budget, allocation_size, force);
+    if (reclaim_target == 0) {
+        return;
+    }
+    allocation_reclaim_callback(reclaim_target, allocation_size, force, allow_texture_gc);
 }
 
 void BufferCache::ProcessPreemptiveDownloads() {
@@ -771,7 +957,6 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
         }
     }
     if constexpr (insert) {
-        total_used_memory += Common::AlignUp(size, CACHING_PAGESIZE);
         buffer.SetLRUId(lru_cache.Insert(buffer_id, gc_tick));
         boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
         bda_addrs.reserve(size_pages);
@@ -783,7 +968,6 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
                         bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
         buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
     } else {
-        total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
         const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
         bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
@@ -792,6 +976,10 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 }
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
+    // Synchronization is always followed by a GPU access to this cache buffer, even when the
+    // memory tracker finds no dirty CPU pages and therefore emits no upload. This is especially
+    // important for direct-memory shaders, which dereference the BDA page table at execution time.
+    MarkBufferUsed(buffer);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -832,13 +1020,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &pre_barrier,
         });
+        instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferUpload,
+                                  Vulkan::GpuCheckpointContext{
+                                      .destination_guest_address = device_addr,
+                                      .transfer_size = total_size_bytes,
+                                      .destination_generation = buffer.address_generation,
+                                  });
         cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &post_barrier,
         });
-        TouchBuffer(buffer);
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
@@ -973,6 +1166,15 @@ void BufferCache::CommitPendingGpuRanges() {
             }
             scheduler.EndRendering();
             const auto cmdbuf = scheduler.CommandBuffer();
+            const u64 copy_bytes = std::accumulate(
+                copies.begin(), copies.end(), u64{},
+                [](u64 total, const vk::BufferCopy& copy) { return total + copy.size; });
+            instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferDownload,
+                                      Vulkan::GpuCheckpointContext{
+                                          .source_guest_address = buffer.CpuAddr(),
+                                          .transfer_size = copy_bytes,
+                                          .source_generation = buffer.address_generation,
+                                      });
             cmdbuf.copyBuffer(buffer.Handle(), download_buffer.Handle(), copies);
         }
         preemptive_copies.clear();
@@ -1051,92 +1253,167 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
     });
 }
 
-void BufferCache::RunGarbageCollector() {
-    SCOPE_EXIT {
-        ++gc_tick;
+void BufferCache::AdvanceGcEpoch() {
+    ++gc_tick;
+}
+
+GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
+    GcResult result;
+    if (!budget.Active()) {
+        return result;
+    }
+
+    // Under critical pressure consider older resources sooner, but never resources touched in the
+    // current epochs. GPU-authored buffers are skipped: reading each one back synchronously here
+    // can serialize dozens of scheduler.Finish() calls on the command processor.
+    const u64 min_age = GcMinimumAge(budget.pressure);
+    if (gc_tick <= min_age) {
+        return result;
+    }
+    const u64 cutoff = gc_tick - min_age;
+    const u32 inspection_multiplier = budget.pressure == GcPressure::Critical ? 8 : 4;
+    static constexpr u32 MaxGcInspections = 4096;
+    u32 inspections_remaining = budget.objects_remaining > MaxGcInspections / inspection_multiplier
+                                    ? MaxGcInspections
+                                    : budget.objects_remaining * inspection_multiplier;
+
+    struct Candidate {
+        BufferId id;
+        u64 size;
+        u64 last_use_tick;
     };
+    std::vector<Candidate> candidates;
+    candidates.reserve(inspections_remaining);
+    u64 candidate_bytes{};
 
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
-    }
-
-    if (total_used_memory < trigger_gc_memory) {
-        return;
-    }
-
-    const bool aggressive = total_used_memory >= critical_gc_memory;
-    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
-
-    static constexpr int MAX_DELETIONS_PER_FRAME = 32;
-    int max_deletions = aggressive ? 64 : 32;
-    max_deletions = std::min(max_deletions, MAX_DELETIONS_PER_FRAME);
-
-    const auto clean_up = [&](BufferId buffer_id) {
-        if (max_deletions == 0)
+    const auto collect = [&](BufferId buffer_id) {
+        if (inspections_remaining == 0 || (budget.pressure != GcPressure::Critical &&
+                                           candidate_bytes >= budget.bytes_remaining)) {
             return true;
+        }
+        --inspections_remaining;
+        ++result.inspected_objects;
 
-        --max_deletions;
-        if (IsBufferInvalid(buffer_id))
+        if (IsBufferInvalid(buffer_id)) {
             return false;
+        }
 
-        EnqueueForGc([this, buffer_id]() {
-            if (IsBufferInvalid(buffer_id))
-                return;
+        Buffer& buffer = slot_buffers[buffer_id];
+        const VAddr address = buffer.CpuAddr();
+        const u64 guest_size = buffer.SizeBytes();
+        const u64 allocation_size = buffer.AllocationSizeBytes();
+        ASSERT_MSG(allocation_size != 0, "Tracked buffer has no physical allocation");
 
-            scheduler.DeferOperation([this, buffer_id] { DeleteBuffer(buffer_id); });
-        });
+        if (IsResourceInFlight(buffer.LastUseTick(), scheduler.CurrentTick())) {
+            ++result.skipped_in_flight;
+            return false;
+        }
+        if (budget.require_completed &&
+            !CanReclaimWithoutWait(buffer.LastUseTick(), budget.completed_tick)) {
+            ++result.skipped_pending;
+            return false;
+        }
 
+        // Pending or preemptive ranges still reference this buffer and cannot be safely
+        // reconstructed from guest memory yet. Reconsider it on a later pass.
+        if (gpu_modified_ranges_pending.Intersects(address, guest_size) ||
+            preemptive_downloads.Intersects(address, guest_size)) {
+            ++result.skipped_gpu_modified;
+            return false;
+        }
+
+        // Keep GPU-authored data resident. A future batched readback path can make these candidates
+        // reclaimable without placing a blocking wait inside the garbage collector.
+        if (IsRegionGpuModified(address, guest_size)) {
+            ++result.skipped_gpu_modified;
+            return false;
+        }
+
+        candidates.push_back({buffer_id, allocation_size, buffer.LastUseTick()});
+        candidate_bytes += allocation_size;
         return false;
     };
 
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-
-    if (total_used_memory >= critical_gc_memory) {
-        max_deletions = 32;
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItemBelow(cutoff, collect);
+    if (budget.pressure == GcPressure::Critical) {
+        std::stable_sort(
+            candidates.begin(), candidates.end(),
+            [](const Candidate& lhs, const Candidate& rhs) { return lhs.size > rhs.size; });
     }
 
-    // Only force VRAM flush in extreme cases to avoid FPS drops
-    if (aggressive && total_used_memory >= critical_gc_memory * 2) {
-        scheduler.Finish();
-    }
+    for (const Candidate& candidate : candidates) {
+        if (!budget.Active()) {
+            break;
+        }
+        Buffer& buffer = slot_buffers[candidate.id];
+        const VAddr address = buffer.CpuAddr();
 
-    RunGarbageCollectorAsync();
+        // Candidate discovery and retirement are intentionally separate. Revalidate the lifetime
+        // at the destructive boundary so a use recorded in between cannot be retired based on the
+        // stale candidate snapshot.
+        if (buffer.LastUseTick() != candidate.last_use_tick ||
+            IsResourceInFlight(buffer.LastUseTick(), scheduler.CurrentTick())) {
+            ++result.skipped_in_flight;
+            continue;
+        }
+        if (budget.require_completed &&
+            !CanReclaimWithoutWait(buffer.LastUseTick(), budget.completed_tick)) {
+            ++result.skipped_pending;
+            continue;
+        }
+
+        // With no GPU-authored data left, guest memory becomes the sole authoritative copy after
+        // eviction. Release the MemoryTracker write watcher before unregistering the host buffer;
+        // otherwise InvalidateMemory can no longer find an owner capable of releasing it.
+        memory_tracker->MarkRegionAsCpuModified(address, buffer.SizeBytes());
+        DeleteBuffer(candidate.id, budget.collect_retirements ? &result : nullptr,
+                     BufferRetirementReason::GarbageCollection);
+        budget.Reclaim(candidate.size);
+        result.reclaimed_bytes += candidate.size;
+        ++result.evicted_objects;
+    }
+    return result;
 }
 
-void BufferCache::EnqueueForGc(std::function<void()> fn) {
-    std::scoped_lock lock(gc_mutex);
-    gc_queue.push(std::move(fn));
+void BufferCache::MarkBufferUsed(Buffer& buffer) {
+    buffer.SetLastUseTick(RecordResourceUse(buffer.LastUseTick(), scheduler.CurrentTick()));
 }
 
-void BufferCache::RunGarbageCollectorAsync() {
-    std::queue<std::function<void()>> local;
-    {
-        std::scoped_lock lock(gc_mutex);
-        std::swap(local, gc_queue);
-    }
-
-    while (!local.empty()) {
-        local.front()();
-        local.pop();
-    }
-
-    // Update memory usage after cleanup
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
-    }
-}
-
-void BufferCache::TouchBuffer(const Buffer& buffer) {
+void BufferCache::TouchBuffer(Buffer& buffer) {
+    MarkBufferUsed(buffer);
     lru_cache.Touch(buffer.LRUId(), gc_tick);
 }
 
-void BufferCache::DeleteBuffer(BufferId buffer_id) {
+void BufferCache::DeleteBuffer(BufferId buffer_id, GcResult* gc_result,
+                               BufferRetirementReason reason) {
     Buffer& buffer = slot_buffers[buffer_id];
+    const u64 last_use_tick = buffer.LastUseTick();
+    const u64 allocation_size = buffer.AllocationSizeBytes();
+    const bool diagnose_retirement = gc_result != nullptr;
+    buffer.SetRetirementContext(reason, scheduler.CurrentTick());
     Unregister(buffer_id);
 
-    // Ensure all GPU operations complete before deletion
-    scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
+    Common::UniqueFunction<void> retirement = [this, buffer_id, allocation_size, last_use_tick,
+                                               diagnose_retirement] {
+        const auto start = std::chrono::steady_clock::now();
+        slot_buffers.erase(buffer_id);
+        const auto end = std::chrono::steady_clock::now();
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        if (diagnose_retirement && elapsed_us >= 10'000) {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow GC buffer retirement: id={}, allocation={} bytes, "
+                        "last_use_tick={}, buffer_destroy={} us",
+                        buffer_id.index, allocation_size, last_use_tick, elapsed_us);
+        }
+    };
+    if (gc_result) {
+        gc_result->QueueRetirement(last_use_tick, std::move(retirement));
+    } else {
+        // General cache invalidation remains tied to the current command buffer. Allocation-driven
+        // GC instead returns this operation to the rasterizer, which waits for the exact last use.
+        scheduler.DeferOperation(std::move(retirement));
+    }
 
     buffer.is_deleted = true;
 }

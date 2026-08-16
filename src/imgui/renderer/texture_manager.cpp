@@ -23,7 +23,7 @@ struct Inner {
     u32 width = 0;
     u32 height = 0;
 
-    Vulkan::UploadTextureData upload_data;
+    Vulkan::UploadTextureData upload_data{};
 
     ~Inner();
 };
@@ -62,10 +62,8 @@ RefCountedTexture::RefCountedTexture(RefCountedTexture&& other) noexcept : inner
 RefCountedTexture& RefCountedTexture::operator=(const RefCountedTexture& other) {
     if (this == &other)
         return *this;
-    inner = other.inner;
-    if (inner != nullptr) {
-        ++inner->count;
-    }
+    RefCountedTexture copy{other};
+    std::swap(inner, copy.inner);
     return *this;
 }
 
@@ -107,10 +105,12 @@ struct Job {
 
 struct UploadJob {
     Inner* core = nullptr;
-    Vulkan::UploadTextureData data;
+    Vulkan::UploadTextureData data{};
     int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
 };
 
+// Protected by g_job_list_mtx. Keeping the state under the same lock as the queue gives the
+// condition variable a reliable predicate and avoids lost wakeups during startup and shutdown.
 static bool g_is_worker_running = false;
 static std::jthread g_worker_thread;
 static std::condition_variable g_worker_cv;
@@ -123,102 +123,159 @@ static std::deque<UploadJob> g_upload_list;
 
 namespace Core::TextureManager {
 
+void ReleaseInner(Inner* core) {
+    if (core != nullptr && core->count.fetch_sub(1) == 1) {
+        delete core;
+    }
+}
+
 Inner::~Inner() {
     if (upload_data.im_texture != nullptr) {
-        std::unique_lock lk{g_upload_mtx};
-        g_upload_list.emplace_back(UploadJob{
-            .data = this->upload_data,
-            .tick = 2,
-        });
+        std::unique_lock state_lk{g_job_list_mtx};
+        if (g_is_worker_running) {
+            std::unique_lock lk{g_upload_mtx};
+            g_upload_list.emplace_back(UploadJob{
+                .data = this->upload_data,
+                .tick = 2,
+            });
+            return;
+        }
+        state_lk.unlock();
+        upload_data.Destroy();
     }
 }
 
 void WorkerLoop() {
     Common::SetCurrentThreadName("shadPS4:ImGuiTextureManager");
-    std::mutex mtx;
-    while (g_is_worker_running) {
-        std::unique_lock lk{mtx};
-        g_worker_cv.wait(lk);
-        if (!g_is_worker_running) {
-            break;
-        }
-        while (true) {
-            g_job_list_mtx.lock();
-            if (g_job_list.empty()) {
-                g_job_list_mtx.unlock();
+    while (true) {
+        Job job;
+        {
+            std::unique_lock lk{g_job_list_mtx};
+            g_worker_cv.wait(lk,
+                             [] { return !g_is_worker_running || !g_job_list.empty(); });
+            if (!g_is_worker_running && g_job_list.empty()) {
                 break;
             }
-            auto [core, png_raw, path] = std::move(g_job_list.front());
+            job = std::move(g_job_list.front());
             g_job_list.pop_front();
-            g_job_list_mtx.unlock();
+        }
 
-            if (Config::getVkCrashDiagnosticEnabled()) {
-                // FIXME: Crash diagnostic hangs when building the command buffer here
+        auto [core, png_raw, path] = std::move(job);
+
+        if (Config::getVkCrashDiagnosticEnabled()) {
+            // FIXME: Crash diagnostic hangs when building the command buffer here
+            ReleaseInner(core);
+            continue;
+        }
+
+        if (!path.empty()) { // Decode PNG from file
+            Common::FS::IOFile file(path, Common::FS::FileAccessMode::Read);
+            if (!file.IsOpen()) {
+                LOG_ERROR(ImGui, "Failed to open PNG file: {}", path.string());
+                ReleaseInner(core);
                 continue;
             }
-
-            if (!path.empty()) { // Decode PNG from file
-                Common::FS::IOFile file(path, Common::FS::FileAccessMode::Read);
-                if (!file.IsOpen()) {
-                    LOG_ERROR(ImGui, "Failed to open PNG file: {}", path.string());
-                    continue;
-                }
-                png_raw.resize(file.GetSize());
-                file.Seek(0);
-                file.ReadRaw<u8>(png_raw.data(), png_raw.size());
-                file.Close();
-            }
-
-            int width, height;
-            const stbi_uc* pixels =
-                stbi_load_from_memory(png_raw.data(), png_raw.size(), &width, &height, nullptr, 4);
-
-            auto texture = Vulkan::UploadTexture(pixels, vk::Format::eR8G8B8A8Unorm, width, height,
-                                                 width * height * 4 * sizeof(stbi_uc));
-            stbi_image_free((void*)pixels);
-
-            core->upload_data = texture;
-            core->width = width;
-            core->height = height;
-
-            std::unique_lock upload_lk{g_upload_mtx};
-            g_upload_list.emplace_back(UploadJob{
-                .core = core,
-            });
+            png_raw.resize(file.GetSize());
+            file.Seek(0);
+            file.ReadRaw<u8>(png_raw.data(), png_raw.size());
+            file.Close();
         }
+
+        int width{};
+        int height{};
+        stbi_uc* pixels =
+            stbi_load_from_memory(png_raw.data(), png_raw.size(), &width, &height, nullptr, 4);
+        if (pixels == nullptr || width <= 0 || height <= 0) {
+            const char* reason = stbi_failure_reason();
+            LOG_ERROR(ImGui, "Failed to decode PNG texture: {}",
+                      reason != nullptr ? reason : "unknown error");
+            stbi_image_free(pixels);
+            ReleaseInner(core);
+            continue;
+        }
+
+        auto texture = Vulkan::UploadTexture(pixels, vk::Format::eR8G8B8A8Unorm, width, height,
+                                             static_cast<size_t>(width) *
+                                                 static_cast<size_t>(height) * 4 * sizeof(stbi_uc));
+        stbi_image_free(pixels);
+
+        core->upload_data = texture;
+        core->width = width;
+        core->height = height;
+
+        std::unique_lock upload_lk{g_upload_mtx};
+        g_upload_list.emplace_back(UploadJob{
+            .core = core,
+        });
     }
 }
 
 void StartWorker() {
-    ASSERT(!g_is_worker_running);
-    g_worker_thread = std::jthread(WorkerLoop);
+    std::unique_lock lk{g_job_list_mtx};
+    ASSERT(!g_is_worker_running && !g_worker_thread.joinable());
     g_is_worker_running = true;
+    g_worker_thread = std::jthread(WorkerLoop);
 }
 
 void StopWorker() {
-    ASSERT(g_is_worker_running);
-    g_is_worker_running = false;
-    g_worker_cv.notify_one();
+    std::deque<Job> canceled_jobs;
+    {
+        std::unique_lock lk{g_job_list_mtx};
+        ASSERT(g_is_worker_running);
+        g_is_worker_running = false;
+        canceled_jobs.swap(g_job_list);
+    }
+    g_worker_cv.notify_all();
+    if (g_worker_thread.joinable()) {
+        g_worker_thread.join();
+    }
+
+    for (auto& job : canceled_jobs) {
+        ReleaseInner(job.core);
+    }
+
+    // No more submissions occur after shutdown starts. Release decoded-but-not-submitted textures
+    // and delayed destruction jobs while the Vulkan backend is still alive.
+    std::deque<UploadJob> pending_uploads;
+    {
+        std::unique_lock lk{g_upload_mtx};
+        pending_uploads.swap(g_upload_list);
+    }
+    for (auto& upload : pending_uploads) {
+        if (upload.core != nullptr) {
+            upload.core->upload_data.Destroy();
+            upload.core->texture_id = nullptr;
+            ReleaseInner(upload.core);
+        } else {
+            upload.data.Destroy();
+        }
+    }
 }
 
 void DecodePngTexture(std::vector<u8> data, Inner* core) {
-    ++core->count;
     Job job{
         .core = core,
         .data = std::move(data),
     };
     std::unique_lock lk{g_job_list_mtx};
+    if (!g_is_worker_running) {
+        return;
+    }
+    ++core->count;
     g_job_list.push_back(std::move(job));
     g_worker_cv.notify_one();
 }
 
 void DecodePngFile(std::filesystem::path path, Inner* core) {
-    ++core->count;
     Job job{
         .core = core,
         .path = std::move(path),
     };
     std::unique_lock lk{g_job_list_mtx};
+    if (!g_is_worker_running) {
+        return;
+    }
+    ++core->count;
     g_job_list.push_back(std::move(job));
     g_worker_cv.notify_one();
 }
@@ -242,9 +299,7 @@ void Submit() {
     if (upload.core != nullptr) {
         upload.core->upload_data.Upload();
         upload.core->texture_id = upload.core->upload_data.im_texture;
-        if (upload.core->count.fetch_sub(1) == 1) {
-            delete upload.core;
-        }
+        ReleaseInner(upload.core);
     } else {
         upload.data.Destroy();
     }

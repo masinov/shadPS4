@@ -552,8 +552,15 @@ SettingsDialog::SettingsDialog(std::shared_ptr<CompatibilityInfoClass> m_compat_
                     emit CompatibilityChanged();
                 });
 
+#if (QT_VERSION < QT_VERSION_CHECK(6, 7, 0))
         connect(ui->enableScreenshotNotificationsCheckBox, &QCheckBox::stateChanged, this,
                 [](int state) { Config::setScreenshotNotificationsEnabled(state == Qt::Checked); });
+#else
+        connect(ui->enableScreenshotNotificationsCheckBox, &QCheckBox::checkStateChanged, this,
+                [](Qt::CheckState state) {
+                    Config::setScreenshotNotificationsEnabled(state == Qt::Checked);
+                });
+#endif
     }
 
     {
@@ -566,8 +573,15 @@ SettingsDialog::SettingsDialog(std::shared_ptr<CompatibilityInfoClass> m_compat_
         connect(ui->chooseHomeTabComboBox, &QComboBox::currentTextChanged, this,
                 [](const QString& hometab) { Config::setChooseHomeTab(hometab.toStdString()); });
 
+#if (QT_VERSION < QT_VERSION_CHECK(6, 7, 0))
         connect(ui->useHostMemoryFallbackCheckBox, &QCheckBox::stateChanged, this,
                 [](int state) { Config::setUseHostMemoryFallback(state == Qt::Checked); });
+#else
+        connect(ui->useHostMemoryFallbackCheckBox, &QCheckBox::checkStateChanged, this,
+                [](Qt::CheckState state) {
+                    Config::setUseHostMemoryFallback(state == Qt::Checked);
+                });
+#endif
 
         connect(ui->memoryCompressionComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [](int index) {

@@ -100,7 +100,7 @@ private:
     void SetStatic(std::optional<bool> visible, bool draw_visible, bool combine);
     void BuildFromQueries(const std::vector<u32>& queries, bool draw_visible, bool combine);
     /// Picks (and seeds, when combining) the predicate slot the reduction writes into.
-    u32 SelectPredicateSlot(vk::CommandBuffer cmdbuf, bool combine, bool& combine_on_gpu);
+    u32 SelectPredicateSlot(bool combine, bool& combine_on_gpu);
     void ActivateGpuPredicate(u32 slot, bool draw_visible);
     u32 AllocPredicateSlot();
     u32 AllocScratchQwords(u32 count);
@@ -130,6 +130,8 @@ private:
     VideoCore::Buffer counter_scratch;
     u32 predicate_cursor{};
     u32 scratch_cursor{};
+    std::array<u64, NumPredicateSlots> predicate_last_use{};
+    u64 scratch_epoch_last_use{};
     vk::UniqueDescriptorSetLayout reduce_desc_layout;
     vk::UniquePipelineLayout reduce_pipeline_layout;
     vk::UniquePipeline reduce_pipeline;

@@ -20,9 +20,27 @@ public:
     static constexpr size_t MANAGER_POOL_SIZE = 32;
     static constexpr size_t PREEMPTIVE_FLUSH_THRESHOLD = 16;
 
+    struct DebugPageState {
+        bool region_exists{};
+        bool cpu_modified{};
+        bool gpu_modified{};
+    };
+
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
+
+    [[nodiscard]] DebugPageState GetDebugPageState(VAddr cpu_addr) {
+        DebugPageState result;
+        IteratePages<false>(
+            cpu_addr, 1, [&result](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
+                result.region_exists = true;
+                result.cpu_modified = manager->template IsRegionModified<Type::CPU>(offset, size);
+                result.gpu_modified = manager->template IsRegionModified<Type::GPU>(offset, size);
+            });
+        return result;
+    }
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {

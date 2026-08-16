@@ -209,11 +209,15 @@ int IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileS
     int result = 0;
 
 #ifdef _WIN32
+    DWORD native_error = ERROR_SUCCESS;
     if (flag != FileShareFlag::ShareNone) {
         file = _wfsopen(path.c_str(), AccessModeToWStr(mode, type), ToWindowsFileShareFlag(flag));
         result = errno;
     } else {
         result = _wfopen_s(&file, path.c_str(), AccessModeToWStr(mode, type));
+    }
+    if (file == nullptr) {
+        native_error = GetLastError();
     }
 #else
     file = std::fopen(path.c_str(), AccessModeToStr(mode, type));
@@ -222,8 +226,15 @@ int IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileS
 
     if (!IsOpen()) {
         const auto ec = std::error_code{result, std::generic_category()};
+#ifdef _WIN32
+        LOG_ERROR(Common_Filesystem,
+                  "Failed to open the file at path={}, errno={} ({}), win32_error={} ({})",
+                  PathToUTF8String(file_path), result, ec.message(), native_error,
+                  NativeErrorToString(static_cast<int>(native_error)));
+#else
         LOG_ERROR(Common_Filesystem, "Failed to open the file at path={}, error_message={}",
                   PathToUTF8String(file_path), ec.message());
+#endif
     }
 
     return result;
@@ -257,14 +268,14 @@ void IOFile::Close() {
     file_mapping = 0;
 }
 
-void IOFile::Unlink() {
+int IOFile::Unlink() {
     if (!IsOpen()) {
-        return;
+        return EBADF;
     }
     if (zar_file) {
         LOG_ERROR(Common_Filesystem, "Cannot unlink file inside ZArchive: {}",
                   PathToUTF8String(file_path));
-        return;
+        return EACCES;
     }
 
     // Mark the file for deletion
@@ -277,15 +288,23 @@ void IOFile::Unlink() {
     HANDLE hfile = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
 
     disposition.DeleteFile = TRUE;
-    NtSetInformationFile(hfile, &iosb, &disposition, sizeof(disposition),
-                         FileDispositionInformation);
+    const u64 status = NtSetInformationFile(hfile, &iosb, &disposition, sizeof(disposition),
+                                            FileDispositionInformation);
+    if (static_cast<s32>(static_cast<u32>(status)) < 0) {
+        LOG_ERROR(Common_Filesystem, "Failed to unlink the file at path={}, ntstatus={:#010x}",
+                  PathToUTF8String(file_path), static_cast<u32>(status));
+        return EACCES;
+    }
 #else
     if (unlink(file_path.c_str()) != 0) {
+        const int result = errno;
         const auto ec = std::error_code{errno, std::generic_category()};
         LOG_ERROR(Common_Filesystem, "Failed to unlink the file at path={}, ec_message={}",
                   PathToUTF8String(file_path), ec.message());
+        return result;
     }
 #endif
+    return 0;
 }
 
 uintptr_t IOFile::GetFileMapping() {

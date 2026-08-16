@@ -147,9 +147,12 @@ struct GeometryRuntimeInfo {
     u64 vs_copy_hash;
 
     bool operator==(const GeometryRuntimeInfo& other) const {
-        return num_outputs == other.num_outputs && outputs == other.outputs && num_invocations &&
-               other.num_invocations && output_vertices == other.output_vertices &&
-               in_primitive == other.in_primitive &&
+        return num_outputs == other.num_outputs && outputs == other.outputs &&
+               num_invocations == other.num_invocations &&
+               output_vertices == other.output_vertices &&
+               in_vertex_data_size == other.in_vertex_data_size &&
+               out_vertex_data_size == other.out_vertex_data_size &&
+               in_primitive == other.in_primitive && mode == other.mode &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
                vs_copy_hash == other.vs_copy_hash;
     }
@@ -213,7 +216,8 @@ struct ComputeRuntimeInfo {
     std::array<bool, 3> tgid_enable;
 
     bool operator==(const ComputeRuntimeInfo& other) const noexcept {
-        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
+        return shared_memory_size == other.shared_memory_size &&
+               workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
     }
 };
 
@@ -251,6 +255,15 @@ struct RuntimeInfo {
     }
 
     bool operator==(const RuntimeInfo& other) const noexcept {
+        if (stage != other.stage || num_user_data != other.num_user_data ||
+            num_input_vgprs != other.num_input_vgprs ||
+            num_allocated_vgprs != other.num_allocated_vgprs ||
+            fp_denorm_mode32 != other.fp_denorm_mode32 ||
+            fp_denorm_mode16_64 != other.fp_denorm_mode16_64 ||
+            fp_round_mode32 != other.fp_round_mode32 ||
+            fp_round_mode16_64 != other.fp_round_mode16_64) {
+            return false;
+        }
         switch (stage) {
         case Stage::Fragment:
             return fs_info == other.fs_info;
@@ -267,7 +280,7 @@ struct RuntimeInfo {
         case Stage::Local:
             return ls_info == other.ls_info;
         default:
-            return true;
+            return false;
         }
     }
 

@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <httplib.h>
 
@@ -64,12 +65,13 @@ public:
 class RequestObj {
 public:
     int id;
-    RequestTemplate* req_template = nullptr;
+    RequestTemplate req_template{};
 
     void SendRequest() {
+        is_sent = true;
         request_future = std::async(std::launch::async, [this] { _SendRequest(); });
 
-        if (!req_template->is_async) {
+        if (!req_template.is_async) {
             WaitForRequest();
         }
     }
@@ -88,25 +90,23 @@ public:
 
     u32 ReadData(char* dest, u32 size) {
 
-        if (result_body == nullptr || dest == nullptr || size == 0 || result_body_size == 0) {
+        if (result_body.empty() || dest == nullptr || size == 0) {
 
             return 0;
         }
 
-        u64 start_index = static_cast<u64>(current_result_read_chunk_index) * size;
-
-        if (start_index >= result_body_size) {
+        if (result_body_read_offset >= result_body.size()) {
 
             return 0;
         }
 
-        u64 remaining_bytes = result_body_size - start_index;
+        const u64 remaining_bytes = result_body.size() - result_body_read_offset;
 
-        u64 bytes_to_copy = (remaining_bytes < size) ? remaining_bytes : size;
+        const u64 bytes_to_copy = std::min<u64>(remaining_bytes, size);
 
-        std::memcpy(dest, result_body + start_index, bytes_to_copy);
+        std::memcpy(dest, result_body.data() + result_body_read_offset, bytes_to_copy);
 
-        current_result_read_chunk_index++;
+        result_body_read_offset += bytes_to_copy;
 
         return static_cast<u32>(bytes_to_copy);
     }
@@ -143,16 +143,12 @@ public:
     void SetPostData(const void* data, u64 size) {
 
         if (data == nullptr || size == 0) {
-
-            post_data = nullptr;
-            post_data_size = 0;
+            post_data.clear();
             return;
         }
 
-        post_data_size = size;
-
-        post_data = new u8[post_data_size];
-        std::memcpy(post_data, data, post_data_size);
+        const auto* begin = static_cast<const u8*>(data);
+        post_data.assign(begin, begin + size);
     }
 
     void AddHeader(const char* name, const char* value) {
@@ -169,7 +165,7 @@ public:
     }
 
     u64 GetContentLength() const {
-        return static_cast<u64>(result_body_size);
+        return static_cast<u64>(result_body.size());
     }
 
     bool IsSent() const {
@@ -177,7 +173,7 @@ public:
     }
 
     bool IsCompleted() {
-        return status_code != -1;
+        return is_sent && IsRequestComplete();
     }
 
     void DebugPrint() const {
@@ -192,13 +188,13 @@ public:
         LOG_DEBUG(Lib_Http, "Host:           {}", (host.empty() ? "[Empty]" : host));
         LOG_DEBUG(Lib_Http, "Path:           {}", (path.empty() ? "[Empty]" : path));
 
-        LOG_DEBUG(Lib_Http, "Post Data Size: {} bytes", post_data_size);
-        LOG_DEBUG(Lib_Http, "Post Data Ptr:  {}", post_data);
+        LOG_DEBUG(Lib_Http, "Post Data Size: {} bytes", post_data.size());
+        LOG_DEBUG(Lib_Http, "Post Data Ptr:  {}", static_cast<const void*>(post_data.data()));
 
-        if (post_data && post_data_size > 0) {
+        if (!post_data.empty()) {
             std::string preview_str;
-            const char* preview = static_cast<const char*>(post_data);
-            for (u64 i = 0; i < std::min<u64>(post_data_size, 20); ++i) {
+            const char* preview = reinterpret_cast<const char*>(post_data.data());
+            for (u64 i = 0; i < std::min<u64>(post_data.size(), 20); ++i) {
                 char c = preview[i];
                 preview_str += (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
             }
@@ -206,13 +202,13 @@ public:
         }
 
         LOG_DEBUG(Lib_Http, "Content Length: {}", content_length);
-        LOG_DEBUG(Lib_Http, "Body Size:      {} bytes", result_body_size);
-        LOG_DEBUG(Lib_Http, "Read Chunk Idx: {}", current_result_read_chunk_index);
-        LOG_DEBUG(Lib_Http, "Body Pointer:   {}", (void*)result_body);
+        LOG_DEBUG(Lib_Http, "Body Size:      {} bytes", result_body.size());
+        LOG_DEBUG(Lib_Http, "Read Offset:    {}", result_body_read_offset);
+        LOG_DEBUG(Lib_Http, "Body Pointer:   {}", static_cast<const void*>(result_body.data()));
 
-        if (result_body) {
+        if (!result_body.empty()) {
             std::string body_preview;
-            for (u64 i = 0; i < std::min<u64>(result_body_size, 50); ++i) {
+            for (u64 i = 0; i < std::min<u64>(result_body.size(), 50); ++i) {
                 char c = result_body[i];
                 body_preview += (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
             }
@@ -232,15 +228,14 @@ public:
     }
 
     RequestObj()
-        : id(0), req_template(nullptr), method(ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID), url(""),
-          content_length(0), status_code(-1), result_body(nullptr), result_body_size(-1),
-          current_result_read_chunk_index(0), post_data(nullptr), is_sent(false) {}
-    explicit RequestObj(s32 req_id, RequestTemplate* req_template, s32 method, std::string url_str,
+        : id(0), method(ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID), url(""), content_length(0),
+          status_code(-1), is_sent(false) {}
+    explicit RequestObj(s32 req_id, const RequestTemplate& req_template_, s32 method,
+                        std::string url_str,
                         u64 cntLen)
-        : id(req_id), req_template(req_template),
+        : id(req_id), req_template(req_template_),
           method(static_cast<OrbisHttpRequestMethod>(method)), content_length(cntLen),
-          status_code(-1), result_body(nullptr), result_body_size(-1),
-          current_result_read_chunk_index(0), post_data(nullptr), is_sent(false) {
+          status_code(-1), is_sent(false) {
 
         SetUrl(url_str);
     }
@@ -248,9 +243,8 @@ public:
 private:
     std::future<void> request_future = {};
 
-    char* result_body = nullptr;
-    u32 current_result_read_chunk_index = 0;
-    u32 result_body_size = 0;
+    std::string result_body;
+    u64 result_body_read_offset = 0;
 
     OrbisHttpRequestMethod method = ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID;
     std::string host = {};
@@ -262,8 +256,7 @@ private:
 
     std::map<std::string, std::string> req_headers;
     std::string url = {};
-    void* post_data = nullptr;
-    u64 post_data_size = 0;
+    std::vector<u8> post_data;
 
     void _SendRequest() {
 
@@ -271,7 +264,7 @@ private:
 
         httplib::Result response = {};
 
-        auto templ_headers = req_template->headers;
+        auto templ_headers = req_template.headers;
 
         httplib::Headers headers;
         for (const auto& pair : templ_headers) {
@@ -289,8 +282,6 @@ private:
             content_type = it->second;
         }
 
-        is_sent = true;
-
         switch (method) {
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_GET:
 
@@ -298,8 +289,8 @@ private:
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_POST:
 
-            response = cli.Post(path, headers, static_cast<char*>(post_data),
-                                static_cast<u64>(post_data_size), content_type);
+            response = cli.Post(path, headers, reinterpret_cast<const char*>(post_data.data()),
+                                static_cast<u64>(post_data.size()), content_type);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_HEAD:
             response = cli.Head(path, headers);
@@ -308,8 +299,8 @@ private:
             response = cli.Options(path, headers);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_PUT:
-            response = cli.Put(path, headers, static_cast<char*>(post_data),
-                               static_cast<u64>(post_data_size), content_type);
+            response = cli.Put(path, headers, reinterpret_cast<const char*>(post_data.data()),
+                               static_cast<u64>(post_data.size()), content_type);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_DELETE:
             response = cli.Delete(path, headers);
@@ -336,9 +327,8 @@ private:
 
         if (response && response->status / 100 == 2) {
 
-            result_body_size = static_cast<u32>(response->body.size());
-            result_body = new char[result_body_size];
-            std::memcpy(result_body, response->body.data(), result_body_size);
+            result_body = std::move(response->body);
+            result_body_read_offset = 0;
         }
     }
 };

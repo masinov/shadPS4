@@ -18,6 +18,8 @@ class WindowSDL;
 
 namespace Vulkan {
 
+class DeviceAddressTracker;
+
 constexpr u32 TargetVulkanApiVersion = VK_API_VERSION_1_3;
 
 vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& emu_window);
@@ -25,7 +27,9 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool enable_crash_diagnostic);
 
-vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
+vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance,
+                                                     DeviceAddressTracker* address_tracker,
+                                                     bool track_device_addresses);
 
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;

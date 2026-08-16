@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cerrno>
 #include <map>
 #include <ranges>
 #include <magic_enum/magic_enum.hpp>
@@ -873,18 +874,20 @@ s32 PS4_SYSV_ABI sceKernelFtruncate(s32 fd, s64 length) {
 }
 
 s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
+    if (from == nullptr || to == nullptr) {
+        *__Error() = POSIX_EINVAL;
+        return -1;
+    }
+    if (strlen(from) > 255 || strlen(to) > 255) {
+        *__Error() = POSIX_ENAMETOOLONG;
+        return -1;
+    }
+
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     bool ro = false;
     const auto src_path = mnt->GetHostPath(from, &ro);
-    if (strlen(from) > 255) {
-        *__Error() = POSIX_ENAMETOOLONG;
-        return -1;
-    }
-    if (strlen(to) > 255) {
-        *__Error() = POSIX_ENAMETOOLONG;
-        return -1;
-    }
-    if (!fs::exists(src_path)) {
+    std::error_code ec;
+    if (!fs::exists(src_path, ec)) {
         *__Error() = POSIX_ENOENT;
         return -1;
     }
@@ -897,10 +900,10 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
         *__Error() = POSIX_EROFS;
         return -1;
     }
-    const bool src_is_dir = fs::is_directory(src_path);
-    const bool dst_is_dir = fs::is_directory(dst_path);
+    const bool src_is_dir = fs::is_directory(src_path, ec);
+    const bool dst_is_dir = fs::is_directory(dst_path, ec);
 
-    if (fs::exists(dst_path)) {
+    if (fs::exists(dst_path, ec)) {
         if (src_is_dir && !dst_is_dir) {
             *__Error() = POSIX_ENOTDIR;
             return -1;
@@ -909,29 +912,58 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
             *__Error() = POSIX_EISDIR;
             return -1;
         }
-        if (dst_is_dir && !fs::is_empty(dst_path)) {
+        if (dst_is_dir && !fs::is_empty(dst_path, ec)) {
             *__Error() = POSIX_ENOTEMPTY;
             return -1;
         }
     }
 
     // On Windows, fs::rename will error if the file has been opened before.
-    fs::copy(src_path, dst_path,
-             fs::copy_options::overwrite_existing | fs::copy_options::recursive);
+    fs::copy(src_path, dst_path, fs::copy_options::overwrite_existing | fs::copy_options::recursive,
+             ec);
+    if (ec) {
+        *__Error() = POSIX_EACCES;
+        LOG_ERROR(Kernel_Fs, "Renaming {} to {} failed while copying: {}", from, to, ec.message());
+        return -1;
+    }
+
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto file = h->GetFile(src_path);
     if (file) {
+        std::scoped_lock file_lock{file->m_mutex};
         Common::FS::FileAccessMode access_mode = Common::FS::FileAccessMode::ReadWrite;
         if (auto* host = file->GetHostFile()) {
             access_mode = host->GetAccessMode();
         }
         file->handle.reset();
-        fs::remove(src_path);
+        ec.clear();
+        const bool removed = fs::remove(src_path, ec);
+        if (!removed || ec) {
+            file->handle = mnt->Open(std::string_view(from), access_mode);
+            *__Error() = POSIX_EACCES;
+            LOG_ERROR(Kernel_Fs, "Renaming {} to {} failed while removing source: {}", from, to,
+                      ec.message());
+            return -1;
+        }
         // Reopen through the mount stack at the destination guest path.
-        file->handle = mnt->Open(std::string_view(to), access_mode);
         file->m_guest_name = to;
+        file->m_host_name = dst_path;
+        file->handle = mnt->Open(std::string_view(to), access_mode);
+        if (!file->handle || !file->handle->IsOpen()) {
+            *__Error() = POSIX_EIO;
+            LOG_ERROR(Kernel_Fs, "Renaming {} to {} succeeded, but reopening destination failed",
+                      from, to);
+            return -1;
+        }
     } else {
-        fs::remove_all(src_path);
+        ec.clear();
+        const auto removed = fs::remove_all(src_path, ec);
+        if (removed == 0 || ec) {
+            *__Error() = POSIX_EACCES;
+            LOG_ERROR(Kernel_Fs, "Renaming {} to {} failed while removing source: {}", from, to,
+                      ec.message());
+            return -1;
+        }
     }
 
     return ORBIS_OK;
@@ -1184,12 +1216,12 @@ s64 PS4_SYSV_ABI sceKernelPwritev(s32 fd, const OrbisKernelIovec* iov, s32 iovcn
 }
 
 s32 PS4_SYSV_ABI posix_unlink(const char* path) {
-    if (strlen(path) > 255) {
-        *__Error() = POSIX_ENAMETOOLONG;
-        return -1;
-    }
     if (path == nullptr) {
         *__Error() = POSIX_EINVAL;
+        return -1;
+    }
+    if (strlen(path) > 255) {
+        *__Error() = POSIX_ENAMETOOLONG;
         return -1;
     }
 
@@ -1208,18 +1240,35 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
         return -1;
     }
 
-    if (fs::is_directory(host_path)) {
+    std::error_code ec;
+    if (!fs::exists(host_path, ec)) {
+        *__Error() = POSIX_ENOENT;
+        return -1;
+    }
+
+    if (fs::is_directory(host_path, ec)) {
         *__Error() = POSIX_EPERM;
         return -1;
     }
 
     auto* file = h->GetFile(host_path);
+    int unlink_result = 0;
     if (file == nullptr) {
-        // File to unlink hasn't been opened, manually open and unlink it.
-        Common::FS::IOFile file(host_path, Common::FS::FileAccessMode::ReadWrite);
-        file.Unlink();
+        // There is no emulated descriptor to preserve, so remove the directory entry directly.
+        const bool removed = fs::remove(host_path, ec);
+        if (!removed || ec) {
+            unlink_result = ec.value() != 0 ? ec.value() : EACCES;
+        }
     } else if (auto* host = file->GetHostFile()) {
-        host->Unlink();
+        unlink_result = host->Unlink();
+    } else {
+        unlink_result = EACCES;
+    }
+
+    if (unlink_result != 0) {
+        *__Error() = POSIX_EACCES;
+        LOG_ERROR(Kernel_Fs, "Unlinking {} failed, host error {}", path, unlink_result);
+        return -1;
     }
 
     LOG_INFO(Kernel_Fs, "Unlinked {}", path);

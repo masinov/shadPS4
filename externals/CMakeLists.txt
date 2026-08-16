@@ -102,7 +102,10 @@ if (NOT TARGET SDL3_image::SDL3_image)
 endif()
 # SDL3_mixer
 if (NOT TARGET SDL3_mixer::SDL3_mixer)
-    set(SDLMIXER_FLAC OFF)
+    # SDL3_mixer split the old SDLMIXER_FLAC option into backend-specific options.
+    # Keep FLAC support through dr_flac without building the redundant libFLAC backend.
+    set(SDLMIXER_FLAC_LIBFLAC OFF CACHE BOOL "" FORCE)
+    set(SDLMIXER_FLAC_DRFLAC ON CACHE BOOL "" FORCE)
     set(SDLMIXER_OGG OFF)
     set(SDLMIXER_MOD OFF)
     set(SDLMIXER_MIDI OFF)

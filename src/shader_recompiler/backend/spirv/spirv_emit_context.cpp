@@ -6,6 +6,7 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/buffer_cache/bda_address_policy.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 
 #include <boost/container/static_vector.hpp>
@@ -1164,24 +1165,45 @@ Id EmitContext::DefineGetBdaPointer() {
     Name(func, "get_bda_pointer");
     AddLabel();
 
+    const auto lookup_label{OpLabel()};
+    const auto out_of_range_label{OpLabel()};
+    const auto lookup_merge_label{OpLabel()};
     const auto fault_label{OpLabel()};
-    const auto available_label{OpLabel()};
-    const auto merge_label{OpLabel()};
+    const auto no_fault_label{OpLabel()};
+    const auto fault_merge_label{OpLabel()};
 
-    // Get page BDA
+    // Guest addresses outside the modeled 40-bit space must not reach either descriptor. In
+    // particular, converting an oversized page to u32 can wrap the page-table lookup and can
+    // turn the subsequent fault-bit write into an out-of-bounds GPU store.
     const auto page{OpShiftRightLogical(U64, address, caching_pagebits)};
     const auto page32{OpUConvert(U32[1], page)};
+    const auto is_in_range{OpULessThan(
+        U1[1], address, Constant(U64, static_cast<u64>(VideoCore::BdaAddressSpaceSize)))};
+    OpSelectionMerge(lookup_merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(is_in_range, lookup_label, out_of_range_label);
+
+    // Get page BDA only after establishing that page32 is a valid descriptor index.
+    AddLabel(lookup_label);
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
     const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
-    const auto bda{OpLoad(U64, bda_ptr)};
+    const auto loaded_bda{OpLoad(U64, bda_ptr)};
+    OpBranch(lookup_merge_label);
 
-    // Check if page is GPU cached
-    const auto is_fault{OpIEqual(U1[1], bda, u64_zero_value)};
-    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    OpBranchConditional(is_fault, fault_label, available_label);
+    AddLabel(out_of_range_label);
+    OpBranch(lookup_merge_label);
 
-    // First time acces, mark as fault
+    AddLabel(lookup_merge_label);
+    const auto bda{OpPhi(U64, loaded_bda, lookup_label, u64_zero_value, out_of_range_label)};
+
+    // A missing in-range page is a recoverable cache fault. An out-of-range address takes the
+    // same null-pointer fallback without touching the fixed-size fault buffer.
+    const auto is_missing{OpIEqual(U1[1], bda, u64_zero_value)};
+    const auto should_record_fault{OpLogicalAnd(U1[1], is_in_range, is_missing)};
+    OpSelectionMerge(fault_merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(should_record_fault, fault_label, no_fault_label);
+
+    // First access, mark as fault.
     AddLabel(fault_label);
     const auto& fault_buffer{buffers[fault_buffer_index]};
     const auto [fault_buffer_id, fault_pointer_type] = fault_buffer.Alias(PointerType::U32);
@@ -1190,23 +1212,20 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
     const auto fault_ptr{
         OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
-    const auto fault_value{OpLoad(U32[1], fault_ptr)};
-    const auto fault_value_masked{OpBitwiseOr(U32[1], fault_value, page_mask)};
-    OpStore(fault_ptr, fault_value_masked);
+    const auto device_scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+    OpAtomicOr(U32[1], fault_ptr, device_scope, u32_zero_value, page_mask);
+    OpBranch(fault_merge_label);
 
-    // Return null pointer
-    const auto fallback_result{u64_zero_value};
-    OpBranch(merge_label);
+    AddLabel(no_fault_label);
+    OpBranch(fault_merge_label);
 
-    // Value is available, compute address
-    AddLabel(available_label);
+    // A valid cached page returns its physical address; both missing and invalid guest addresses
+    // return null so the caller uses its existing lossless fallback.
+    AddLabel(fault_merge_label);
     const auto offset_in_bda{OpBitwiseAnd(U64, address, caching_pagemask)};
     const auto addr{OpIAdd(U64, bda, offset_in_bda)};
-    OpBranch(merge_label);
-
-    // Merge
-    AddLabel(merge_label);
-    const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_label)};
+    const auto is_available{OpINotEqual(U1[1], bda, u64_zero_value)};
+    const auto result{OpSelect(U64, is_available, addr, u64_zero_value)};
     OpReturnValue(result);
     OpFunctionEnd();
     return func;

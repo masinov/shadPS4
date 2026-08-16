@@ -53,15 +53,6 @@ std::string_view BufferTypeName(MemoryUsage type) {
     switch (usage) {
     case MemoryUsage::DeviceLocal:
     case MemoryUsage::Stream:
-        if (Config::getUseHostMemoryFallback()) {
-            static bool logged_once = false;
-            if (!logged_once) {
-                LOG_INFO(Render,
-                         "Host memory fallback enabled - using system RAM for GPU allocations");
-                logged_once = true;
-            }
-            return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryUsage::Upload:
     case MemoryUsage::Download:
@@ -74,18 +65,27 @@ UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
     : device{device_}, allocator{allocator_} {}
 
 UniqueBuffer::~UniqueBuffer() {
+    Destroy();
+}
+
+void UniqueBuffer::Destroy() noexcept {
     if (buffer) {
         vmaDestroyBuffer(allocator, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        bda_addr = 0;
     }
 }
 
 void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
-                          VmaAllocationInfo* out_alloc_info) {
+                          VmaAllocationInfo* out_alloc_info,
+                          const std::function<void()>& allocation_failure_callback) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-    const VmaAllocationCreateFlags bda_flag =
-        with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage),
+    VmaAllocationCreateInfo alloc_ci = {
+        // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT makes every backing memory block BDA
+        // capable. BDA buffers do not require dedicated allocations, and forcing every cache
+        // buffer to be dedicated prevents VMA from suballocating them and increases fragmentation.
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
         .usage = MemoryUsageVma(usage),
         .requiredFlags = 0,
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
@@ -97,6 +97,40 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     VkBuffer unsafe_buffer{};
     VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                       &allocation, out_alloc_info);
+    const auto reset_outputs = [&] {
+        unsafe_buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        if (out_alloc_info) {
+            *out_alloc_info = {};
+        }
+    };
+    if ((result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
+        allocation_failure_callback) {
+        LOG_WARNING(Render_Vulkan,
+                    "Buffer allocation of {} bytes failed within the reported memory budget; "
+                    "running emergency garbage collection before retrying",
+                    buffer_ci.size);
+        reset_outputs();
+        allocation_failure_callback();
+        result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                 &allocation, out_alloc_info);
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        const bool use_host_fallback =
+            Config::getUseHostMemoryFallback() &&
+            (usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream);
+        LOG_WARNING(Render_Vulkan,
+                    "Buffer allocation of {} bytes failed within the reported memory budget; "
+                    "retrying without the budget restriction{}",
+                    buffer_ci.size, use_host_fallback ? " with host memory fallback" : "");
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (use_host_fallback) {
+            alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        }
+        reset_outputs();
+        result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                 &allocation, out_alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
@@ -112,7 +146,8 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
-               VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
+               VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_,
+               const std::function<void()>& allocation_failure_callback)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
     // Create buffer object.
@@ -121,7 +156,10 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         .usage = flags,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, usage, &alloc_info);
+    buffer.Create(buffer_ci, usage, &alloc_info, allocation_failure_callback);
+    allocation_size = alloc_info.size;
+    address_generation = instance->TrackBufferAddress(buffer.bda_addr, size_bytes, cpu_addr,
+                                                      allocation_size, static_cast<u32>(usage));
 
     const auto device = instance->GetDevice();
     Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
@@ -133,6 +171,17 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
     }
     is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+}
+
+Buffer::~Buffer() {
+    // A moved-from Buffer no longer owns its Vulkan buffer, so only the live owner retires the
+    // diagnostic generation. This preserves exact lifetimes when SlotVector grows and moves its
+    // elements.
+    if (buffer.bda_addr != 0) {
+        instance->RetireBufferAddress(address_generation, last_use_tick, scheduler->CurrentTick(),
+                                      retirement_scheduled_tick,
+                                      static_cast<u32>(retirement_reason));
+    }
 }
 
 void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {

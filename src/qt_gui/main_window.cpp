@@ -4111,7 +4111,7 @@ void MainWindow::RestartGame() {
 
 void MainWindow::initializeGamepad() {
 
-    if (SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK) < 0) {
+    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
         return;
     }
 

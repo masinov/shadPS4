@@ -3,14 +3,17 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <queue>
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/pending_operation_queue.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
@@ -55,15 +58,18 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 3> wait_semas;
     std::array<u64, 3> wait_ticks;
+    std::array<vk::PipelineStageFlags, 3> wait_stage_masks;
     std::array<vk::Semaphore, 3> signal_semas;
     std::array<u64, 3> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1,
+                 vk::PipelineStageFlags stage_mask = vk::PipelineStageFlagBits::eAllCommands) {
         wait_semas[num_wait_semas] = semaphore;
-        wait_ticks[num_wait_semas++] = tick;
+        wait_ticks[num_wait_semas] = tick;
+        wait_stage_masks[num_wait_semas++] = stage_mask;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
@@ -345,6 +351,32 @@ struct DynamicState {
     }
 };
 
+/// Identifies which operation currently holds Scheduler::submit_mutex. Recorded so a waiter can
+/// attribute a long lock wait to its holder instead of to its own work.
+enum class SubmitCriticalPhase : u8 {
+    None,
+    ImGui,
+    QueueSubmit,
+    Present,
+    SwapchainRecreate,
+};
+
+[[nodiscard]] constexpr std::string_view SubmitCriticalPhaseName(SubmitCriticalPhase phase) {
+    switch (phase) {
+    case SubmitCriticalPhase::None:
+        return "none";
+    case SubmitCriticalPhase::ImGui:
+        return "imgui";
+    case SubmitCriticalPhase::QueueSubmit:
+        return "queue_submit";
+    case SubmitCriticalPhase::Present:
+        return "present";
+    case SubmitCriticalPhase::SwapchainRecreate:
+        return "swapchain_recreate";
+    }
+    return "unknown";
+}
+
 class Scheduler {
 public:
     explicit Scheduler(const Instance& instance);
@@ -364,8 +396,9 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
-    /// Attempts to execute operations whose tick the GPU has caught up with.
-    void PopPendingOperations();
+    /// Attempts to execute operations whose tick the GPU has caught up with. Callers that just
+    /// refreshed the master timeline can suppress the otherwise redundant driver query.
+    u32 PopPendingOperations(bool refresh_timeline = true);
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -410,7 +443,7 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
-        pending_ops.emplace(std::move(func), CurrentTick());
+        pending_ops.Push(std::move(func), CurrentTick());
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -425,7 +458,46 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// Publishes the phase executed by the current holder of submit_mutex.
+    static void SetSubmitCriticalPhase(SubmitCriticalPhase phase) noexcept {
+        submit_critical_phase.store(phase, std::memory_order_release);
+    }
+
+    /// Returns the phase published by the current holder of submit_mutex.
+    [[nodiscard]] static SubmitCriticalPhase GetSubmitCriticalPhase() noexcept {
+        return submit_critical_phase.load(std::memory_order_acquire);
+    }
+
+    /// Acquires submit_mutex, remembering which phase held it if the lock was contended, and
+    /// publishes the given phase for the duration of the scope.
+    class SubmitLock {
+    public:
+        explicit SubmitLock(SubmitCriticalPhase phase) : lock{submit_mutex, std::defer_lock} {
+            if (!lock.try_lock()) {
+                contended_phase = GetSubmitCriticalPhase();
+                lock.lock();
+            }
+            SetSubmitCriticalPhase(phase);
+        }
+        ~SubmitLock() {
+            SetSubmitCriticalPhase(SubmitCriticalPhase::None);
+        }
+        SubmitLock(const SubmitLock&) = delete;
+        SubmitLock& operator=(const SubmitLock&) = delete;
+
+        /// Phase that held the mutex when this acquisition had to wait, None otherwise.
+        [[nodiscard]] SubmitCriticalPhase ContendedPhase() const noexcept {
+            return contended_phase;
+        }
+
+    private:
+        std::unique_lock<std::mutex> lock;
+        SubmitCriticalPhase contended_phase{SubmitCriticalPhase::None};
+    };
+
 private:
+    static std::atomic<SubmitCriticalPhase> submit_critical_phase;
+
     void AllocateWorkerCommandBuffers();
 
     void SubmitExecution(SubmitInfo& info);
@@ -443,7 +515,7 @@ private:
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
-    std::queue<PendingOp> pending_ops;
+    PendingOperationQueue pending_ops;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

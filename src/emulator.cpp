@@ -385,7 +385,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     VideoCore::LoadRenderDoc();
 
     if (!id.empty()) {
-        MemoryPatcher::g_game_serial = id;
+        MemoryPatcher::SetGameSerial(id);
         Libraries::Np::NpTrophy::game_serial = id;
 
         const auto trophyDir =
