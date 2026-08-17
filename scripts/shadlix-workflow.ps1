@@ -22,7 +22,7 @@ tree. Send performs a network write only when that explicit action is selected.
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Status', 'ImportReport', 'Build', 'Package', 'BuildPackage', 'Send')]
+    [ValidateSet('Status', 'ImportReport', 'Build', 'Package', 'BuildPackage', 'Send', 'FetchReport', 'SetupSshKey')]
     [string]$Action = 'Status',
 
     [string]$Tag,
@@ -44,6 +44,27 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+
+# Load .env (KEY=VALUE lines; # comments). Real environment variables win over file values so a
+# per-invocation override never requires editing the file.
+$DotEnvPath = Join-Path $RepoRoot '.env'
+if (Test-Path -LiteralPath $DotEnvPath) {
+    foreach ($line in Get-Content -LiteralPath $DotEnvPath) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+        $eq = $trimmed.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $key = $trimmed.Substring(0, $eq).Trim()
+        $value = $trimmed.Substring($eq + 1).Trim()
+        if ($value.Length -ge 2 -and (($value[0] -eq '"' -and $value[-1] -eq '"') -or ($value[0] -eq "'" -and $value[-1] -eq "'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if ($value.Length -eq 0) { continue }
+        if (-not (Test-Path "env:$key")) {
+            Set-Item -Path "env:$key" -Value $value
+        }
+    }
+}
 $BuildRoot = Join-Path $RepoRoot 'Build'
 $LocalReportsRoot = Join-Path $RepoRoot 'local-reports'
 $ResolvedBuildDirectory = [IO.Path]::GetFullPath((Join-Path $RepoRoot $BuildDirectory))
@@ -320,6 +341,142 @@ function Package-Shadlix {
     }
 }
 
+# --- Tester SSH plumbing -----------------------------------------------------
+
+function Get-TesterConfig {
+    $user = $env:TESTER_SSH_USER
+    $sshHost = $env:TESTER_SSH_HOST
+    if ([string]::IsNullOrWhiteSpace($user) -or [string]::IsNullOrWhiteSpace($sshHost)) {
+        # Backward compatibility with the previous single-variable form.
+        if (-not [string]::IsNullOrWhiteSpace($Remote) -and $Remote.Contains('@')) {
+            $parts = $Remote.Split('@', 2)
+            $user = $parts[0]
+            $sshHost = $parts[1]
+        } else {
+            throw 'Tester SSH target missing: set TESTER_SSH_USER and TESTER_SSH_HOST in .env (see .env.example).'
+        }
+    }
+    $port = $env:TESTER_SSH_PORT
+    if ([string]::IsNullOrWhiteSpace($port)) { $port = '22' }
+    $dest = $env:TESTER_DEST_DIR_ROOT
+    if ([string]::IsNullOrWhiteSpace($dest)) { $dest = $RemoteDirectory.TrimEnd('/') }
+    $reportDir = $env:TESTER_REPORT_DIR
+    if ([string]::IsNullOrWhiteSpace($reportDir)) { $reportDir = $dest }
+    $reportGlob = $env:TESTER_REPORT_GLOB
+    if ([string]::IsNullOrWhiteSpace($reportGlob)) { $reportGlob = 'shadlix-*report*.zip' }
+    return [pscustomobject]@{
+        User = $user
+        SshHost = $sshHost
+        Port = $port
+        Key = $env:TESTER_SSH_KEY
+        Password = $env:TESTER_SSH_PASSWORD
+        DestDir = $dest.TrimEnd('/')
+        ReportDir = $reportDir.TrimEnd('/')
+        ReportGlob = $reportGlob
+        Target = "$user@$sshHost"
+    }
+}
+
+# Runs ssh/scp non-interactively. Key auth is used when TESTER_SSH_KEY is set; otherwise the
+# password is supplied through SSH_ASKPASS (never on the command line). Returns stdout lines.
+function Invoke-TesterSsh {
+    param(
+        [Parameter(Mandatory)][ValidateSet('ssh', 'scp', 'sftp', 'ssh-keygen')] [string]$Tool,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)]$Config
+    )
+    $exe = Join-Path $env:SystemRoot "System32/OpenSSH/$Tool.exe"
+    if (-not (Test-Path -LiteralPath $exe)) {
+        $exe = "$Tool.exe"
+    }
+    $common = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15')
+    if (-not [string]::IsNullOrWhiteSpace($Config.Key)) {
+        $common += @('-i', $Config.Key, '-o', 'BatchMode=yes')
+    }
+    $askpass = $null
+    $oldEnv = @{}
+    try {
+        if ([string]::IsNullOrWhiteSpace($Config.Key) -and
+            -not [string]::IsNullOrWhiteSpace($Config.Password)) {
+            $askpass = Join-Path ([IO.Path]::GetTempPath()) ("shadlix-askpass-{0}.cmd" -f [Guid]::NewGuid().ToString('N'))
+            # %TESTER_SSH_PASSWORD% is expanded by the child cmd from its environment, so the
+            # password is never written to disk.
+            Set-Content -LiteralPath $askpass -Value '@echo %TESTER_SSH_PASSWORD%' -Encoding ascii
+            foreach ($name in 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY', 'TESTER_SSH_PASSWORD') {
+                $oldEnv[$name] = [Environment]::GetEnvironmentVariable($name)
+            }
+            $env:SSH_ASKPASS = $askpass
+            $env:SSH_ASKPASS_REQUIRE = 'force'
+            $env:DISPLAY = ':0'
+            $env:TESTER_SSH_PASSWORD = $Config.Password
+        }
+        $output = & $exe @common @Arguments 2>&1
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            throw "$Tool failed with exit code ${code}: $($output | Select-Object -Last 3 | Out-String)"
+        }
+        return $output
+    } finally {
+        foreach ($name in $oldEnv.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $oldEnv[$name])
+        }
+        if ($askpass -and (Test-Path -LiteralPath $askpass)) {
+            Remove-Item -LiteralPath $askpass -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-PortArgs([string]$Tool, $Config) {
+    if ($Tool -eq 'scp') { return @('-P', $Config.Port) }
+    return @('-p', $Config.Port)
+}
+
+function Setup-SshKey {
+    $config = Get-TesterConfig
+    if ([string]::IsNullOrWhiteSpace($config.Password)) {
+        throw 'SetupSshKey needs TESTER_SSH_PASSWORD in .env for the one-time key installation.'
+    }
+    $keyPath = Join-Path $env:USERPROFILE '.ssh/shadlix_tester'
+    if (-not (Test-Path -LiteralPath $keyPath)) {
+        $sshDir = Split-Path -Parent $keyPath
+        if (-not (Test-Path -LiteralPath $sshDir)) { New-Item -ItemType Directory -Path $sshDir | Out-Null }
+        $keygen = Join-Path $env:SystemRoot 'System32/OpenSSH/ssh-keygen.exe'
+        & $keygen -t ed25519 -N '""' -C 'shadlix-workflow' -f $keyPath | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed with exit code $LASTEXITCODE." }
+    }
+    $publicKey = (Get-Content -LiteralPath "$keyPath.pub" -Raw).Trim()
+    # Works for both OpenSSH-on-Windows (administrators_authorized_keys not needed for normal
+    # users) and Linux sshd. Appends only if absent.
+    $remoteCmd = "powershell -NoProfile -Command `"`$k='$publicKey'; `$f=Join-Path `$env:USERPROFILE '.ssh/authorized_keys'; New-Item -ItemType Directory -Force (Split-Path `$f) | Out-Null; if (-not (Test-Path `$f) -or -not (Select-String -LiteralPath `$f -SimpleMatch `$k -Quiet)) { Add-Content -LiteralPath `$f -Value `$k }`""
+    Invoke-TesterSsh -Tool ssh -Config $config -Arguments ((Get-PortArgs 'ssh' $config) + @($config.Target, $remoteCmd)) | Out-Null
+    Write-CompactResult ([pscustomobject]@{
+        Action = 'SetupSshKey'
+        Key = $keyPath
+        Note = "Key installed. Set TESTER_SSH_KEY=$keyPath in .env and remove TESTER_SSH_PASSWORD."
+    })
+}
+
+function Fetch-Report {
+    $config = Get-TesterConfig
+    # Newest matching report on the tester side, by write time.
+    $listCmd = "powershell -NoProfile -Command `"Get-ChildItem -Path '$($config.ReportDir)/$($config.ReportGlob)' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName`""
+    $remotePath = (Invoke-TesterSsh -Tool ssh -Config $config -Arguments ((Get-PortArgs 'ssh' $config) + @($config.Target, $listCmd)) |
+        Where-Object { $_ -is [string] -or $_ -isnot [System.Management.Automation.ErrorRecord] } |
+        Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($remotePath)) {
+        throw "No report matching '$($config.ReportGlob)' found in $($config.ReportDir) on $($config.Target)."
+    }
+    $localDir = Join-Path $env:USERPROFILE 'Downloads'
+    $localPath = Join-Path $localDir (Split-Path -Leaf $remotePath)
+    $scpSource = '{0}:"{1}"' -f $config.Target, ($remotePath -replace '\', '/')
+    Invoke-TesterSsh -Tool scp -Config $config -Arguments ((Get-PortArgs 'scp' $config) + @($scpSource, $localPath)) | Out-Null
+    if (-not (Test-Path -LiteralPath $localPath)) {
+        throw "scp reported success but $localPath does not exist."
+    }
+    $script:SourceArchive = $localPath
+    Import-ShadlixReport
+}
+
 function Send-Shadlix {
     if ([string]::IsNullOrWhiteSpace($Archive)) {
         $candidate = Get-ChildItem -LiteralPath $BuildRoot -File -Filter 'Shadlix-portable-*.zip' |
@@ -331,18 +488,13 @@ function Send-Shadlix {
     } else {
         $archiveItem = Get-Item -LiteralPath (Resolve-WorkflowPath $Archive)
     }
-    if ([string]::IsNullOrWhiteSpace($Remote)) {
-        throw 'No transfer target: set SHADLIX_REMOTE (user@host) or pass -Remote.'
-    }
-    & scp.exe $archiveItem.FullName "${Remote}:$RemoteDirectory"
-    if ($LASTEXITCODE -ne 0) {
-        throw "scp failed with exit code $LASTEXITCODE."
-    }
+    $config = Get-TesterConfig
+    Invoke-TesterSsh -Tool scp -Config $config -Arguments ((Get-PortArgs 'scp' $config) + @($archiveItem.FullName, "$($config.Target):$($config.DestDir)/")) | Out-Null
     return [pscustomobject]@{
         Action = 'Send'
         Archive = $archiveItem.FullName
         ArchiveSha256 = Get-Sha256 $archiveItem.FullName
-        Destination = "${Remote}:$RemoteDirectory"
+        Destination = "$($config.Target):$($config.DestDir)/"
     }
 }
 
@@ -388,6 +540,8 @@ try {
             [pscustomobject]@{ Action = 'BuildPackage'; Build = $buildResult; Package = $packageResult }
         }
         'Send' { Send-Shadlix }
+        'FetchReport' { Fetch-Report }
+        'SetupSshKey' { Setup-SshKey; return }
     }
     Write-CompactResult $result
 } finally {

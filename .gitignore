@@ -424,3 +424,6 @@ result
 
 # Local diagnostic bundles and generated analysis reports
 /local-reports/
+
+# Local workflow environment (tester SSH credentials)
+/.env
