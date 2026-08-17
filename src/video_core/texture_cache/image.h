@@ -32,10 +32,11 @@ enum ImageFlagBits : u32 {
     GpuDirty =
         1 << 2, ///< Image contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
-    GpuModified = 1 << 3, ///< Contents have been modified from the GPU
-    MaybeReused = 1 << 4, ///< Memory region containing this image was maybe reused by the GPU
-    Registered = 1 << 6,  ///< True when the image is registered
-    Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
+    GpuModified = 1 << 3,      ///< Contents have been modified from the GPU
+    MaybeReused = 1 << 4,      ///< Memory region containing this image was maybe reused by the GPU
+    Registered = 1 << 6,       ///< True when the image is registered
+    Picked = 1 << 7,           ///< Temporary flag to mark the image as picked
+    EvictionReadback = 1 << 8, ///< A GC-driven readback of this image is recorded or in flight
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

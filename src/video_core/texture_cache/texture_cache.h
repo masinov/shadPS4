@@ -120,6 +120,15 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// Records GC-nominated GPU-modified images for asynchronous readback into guest memory.
+    /// Once the writeback completes they become CPU-authoritative and therefore evictable.
+    void RecordEvictionReadbacks();
+
+private:
+    /// Validates completed readbacks and writes them into guest memory. Cache mutex held.
+    void ApplyReadyReadbacks();
+
+public:
     /// Add an image to the download queue for guest memory writeback on next submit.
     void AddDownload(ImageId image_id) {
         std::unique_lock lk{download_images_mutex};
@@ -353,6 +362,21 @@ private:
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 gc_tick = 0;
+    std::vector<ImageId> eviction_readbacks;
+    /// Image ids with a recorded-but-unwritten eviction readback. DeleteImage removes an id here
+    /// so a completed readback of a deleted image is discarded instead of touching a reused slot.
+    std::unordered_set<u32> eviction_readback_inflight;
+    struct ReadyReadback {
+        ImageId image_id;
+        VAddr guest_address;
+        u64 guest_size;
+        u64 record_access_tick;
+        std::vector<u8> data;
+    };
+    /// Completed downloads waiting for validation + guest writeback on the GPU thread. Guarded by
+    /// download_images_mutex only: the producing deferred callback must not take the cache mutex
+    /// (it can run inside a flush made while the cache mutex is held).
+    std::vector<ReadyReadback> ready_readbacks;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     bool readback_linear_images;
     PageTable page_table;

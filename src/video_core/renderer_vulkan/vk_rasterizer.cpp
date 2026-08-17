@@ -774,6 +774,7 @@ void Rasterizer::OnSubmit() {
         }
 
         gc_pressure = gc_budget.pressure;
+        texture_cache.RecordEvictionReadbacks();
 
         // Cheap cumulative view of the buffer cache: replacement kinds and, for sparse buffers,
         // demand binding volume and total bound bytes. Sampled so it stays a few lines per minute.

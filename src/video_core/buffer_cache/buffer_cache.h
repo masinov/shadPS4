@@ -215,6 +215,10 @@ public:
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
+    /// Marks a region as CPU-authoritative after its GPU contents were written back to guest
+    /// memory (eviction readback). Guest memory becomes the single source of truth again.
+    void MarkRegionAsFlushed(VAddr addr, size_t size);
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size, bool allow_texture_gc = true);
 

@@ -596,6 +596,11 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
     texture_cache.MarkAsMaybeReused(addr, size);
 }
 
+void BufferCache::MarkRegionAsFlushed(VAddr addr, size_t size) {
+    gpu_modified_ranges.Subtract(addr, size);
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, true);
+}
+
 void BufferCache::MarkRegionAsCpuModified(VAddr addr, size_t size) {
     memory_tracker->MarkRegionAsCpuModified(addr, size);
 }

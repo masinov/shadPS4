@@ -114,6 +114,122 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+void TextureCache::RecordEvictionReadbacks() {
+    std::scoped_lock lock{mutex};
+    ApplyReadyReadbacks();
+    if (eviction_readbacks.empty()) {
+        return;
+    }
+    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    for (const ImageId image_id : eviction_readbacks) {
+        Image& image = slot_images[image_id];
+        const auto clear_flag = [&] { image.flags &= ~ImageFlagBits::EvictionReadback; };
+        if (False(image.flags & ImageFlagBits::Registered) ||
+            False(image.flags & ImageFlagBits::GpuModified) || image.binding.is_bound ||
+            image.binding.is_target) {
+            clear_flag();
+            continue;
+        }
+
+        const VAddr image_addr = image.info.guest_address;
+        const u64 image_size = image.info.guest_size;
+        u32 copy_size = 0;
+        boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+        for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+            const u32 width = std::max(image.info.size.width >> mip, 1u);
+            const u32 height = std::max(image.info.size.height >> mip, 1u);
+            const u32 depth =
+                image.info.props.is_volume ? std::max(image.info.size.depth >> mip, 1u) : 1u;
+            const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[mip];
+            const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
+            const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
+            buffer_copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_offset,
+                .bufferRowLength = mip_pitch,
+                .bufferImageHeight = mip_height,
+                .imageSubresource{
+                    .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {extent_width, extent_height, depth},
+            });
+            copy_size += mip_size;
+        }
+        if (copy_size == 0) {
+            clear_flag();
+            continue;
+        }
+        // Never wait for staging space here; a full ring simply retries on a later pass.
+        const auto [mapping_data, mapping_offset] = download_buffer.Map(copy_size, 1, false);
+        if (!mapping_data) {
+            clear_flag();
+            continue;
+        }
+
+        scheduler.EndRendering();
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+        tile_manager.TileImage(image, buffer_copies, download_buffer.Handle(), mapping_offset,
+                               copy_size);
+        download_buffer.Commit();
+        image.tick_accessed_last = scheduler.CurrentTick();
+
+        const u64 record_access_tick = image.tick_accessed_last;
+        const u32 write_size = static_cast<u32>(std::min<u64>(copy_size, image_size));
+        eviction_readback_inflight.insert(image_id.index);
+        // The callback may execute inside a flush performed while the cache mutex is held, so it
+        // only snapshots the staged bytes (the download-ring region is reusable from this moment)
+        // and defers all cache-state work to the next RecordEvictionReadbacks call.
+        scheduler.DeferOperation(
+            [this, image_id, image_addr, image_size, mapping_data, write_size, record_access_tick] {
+                ReadyReadback ready{
+                    .image_id = image_id,
+                    .guest_address = image_addr,
+                    .guest_size = image_size,
+                    .record_access_tick = record_access_tick,
+                };
+                ready.data.resize(write_size);
+                std::memcpy(ready.data.data(), mapping_data, write_size);
+                std::unique_lock lk{download_images_mutex};
+                ready_readbacks.push_back(std::move(ready));
+            });
+    }
+    eviction_readbacks.clear();
+}
+
+void TextureCache::ApplyReadyReadbacks() {
+    std::vector<ReadyReadback> ready;
+    {
+        std::unique_lock lk{download_images_mutex};
+        ready.swap(ready_readbacks);
+    }
+    for (ReadyReadback& readback : ready) {
+        if (eviction_readback_inflight.erase(readback.image_id.index) == 0) {
+            // Deleted before completion; the slot may already hold a different image.
+            continue;
+        }
+        Image& image = slot_images[readback.image_id];
+        const bool valid = True(image.flags & ImageFlagBits::Registered) &&
+                           True(image.flags & ImageFlagBits::EvictionReadback) &&
+                           image.info.guest_address == readback.guest_address;
+        if (!valid) {
+            continue;
+        }
+        image.flags &= ~ImageFlagBits::EvictionReadback;
+        if (image.tick_accessed_last != readback.record_access_tick) {
+            // Used (and possibly re-written) after the download was recorded; the staged copy may
+            // be stale. Abandon; the collector can nominate it again later.
+            continue;
+        }
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(readback.guest_address),
+                                                  readback.data.data(), readback.data.size());
+        image.flags &= ~ImageFlagBits::GpuModified;
+        buffer_cache.MarkRegionAsFlushed(readback.guest_address, readback.guest_size);
+    }
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
@@ -1050,6 +1166,15 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
         }
 
         if (True(image.flags & ImageFlagBits::GpuModified)) {
+            // GPU-authored contents cannot be discarded, but they can be written back to guest
+            // memory asynchronously; once that completes the image is CPU-authoritative and a
+            // later pass can evict it. Nominate a bounded number of large candidates per pass.
+            if (False(image.flags & ImageFlagBits::EvictionReadback) &&
+                image.info.pixel_format != vk::Format::eUndefined &&
+                image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4) {
+                image.flags |= ImageFlagBits::EvictionReadback;
+                eviction_readbacks.push_back(image_id);
+            }
             ++result.skipped_gpu_modified;
             return false;
         }
@@ -1109,6 +1234,7 @@ void TextureCache::DeleteImage(ImageId image_id, GcResult* gc_result) {
 
     {
         std::unique_lock lk{download_images_mutex};
+        eviction_readback_inflight.erase(image_id.index);
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
         }
