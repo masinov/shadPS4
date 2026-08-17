@@ -44,6 +44,8 @@ constexpr std::string_view CheckpointName(GpuCheckpoint checkpoint) {
         return "tile-linear";
     case GpuCheckpoint::TileImageDispatch:
         return "tile-image";
+    case GpuCheckpoint::FaultParse:
+        return "fault-parse";
     case GpuCheckpoint::BufferUpload:
         return "buffer-upload";
     case GpuCheckpoint::BufferDownload:

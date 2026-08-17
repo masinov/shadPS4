@@ -128,6 +128,10 @@ private:
     /// Validates completed readbacks and writes them into guest memory. Cache mutex held.
     void ApplyReadyReadbacks();
 
+    /// True when reading this image back and flushing its range cannot lose newer aliased
+    /// GPU-authored content. Cache mutex held.
+    bool IsReadbackViable(ImageId image_id, Image& image);
+
 public:
     /// Add an image to the download queue for guest memory writeback on next submit.
     void AddDownload(ImageId image_id) {

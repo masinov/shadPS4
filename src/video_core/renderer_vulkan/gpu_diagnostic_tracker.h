@@ -27,6 +27,7 @@ enum class GpuCheckpoint : u8 {
     Detile,
     TileLinear,
     TileImageDispatch,
+    FaultParse,
     BufferUpload,
     BufferDownload,
     BufferCopy,

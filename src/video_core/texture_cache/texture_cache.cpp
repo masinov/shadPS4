@@ -114,6 +114,30 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+bool TextureCache::IsReadbackViable(ImageId image_id, Image& image) {
+    // 96% of Run 37 nominations aborted at writeback because another GPU-modified image aliases
+    // the range; every such nomination cost a recorded tiler dispatch for nothing. Decide before
+    // recording. An aliased group is still viable when this image dominates it: every other
+    // GPU-modified alias lies fully inside this image's range and was accessed no later, so this
+    // image's bytes are the authoritative content of the whole range (guest memory holds one copy;
+    // on hardware the aliases would read exactly these bytes).
+    bool viable = true;
+    ForEachImageInRegion(
+        image.info.guest_address, image.info.guest_size, [&](ImageId other_id, Image& other) {
+            if (other_id == image_id || False(other.flags & ImageFlagBits::GpuModified)) {
+                return;
+            }
+            const bool contained = other.info.guest_address >= image.info.guest_address &&
+                                   other.info.guest_address + other.info.guest_size <=
+                                       image.info.guest_address + image.info.guest_size;
+            if (!contained || other.tick_accessed_last > image.tick_accessed_last ||
+                other.binding.is_bound || other.binding.is_target) {
+                viable = false;
+            }
+        });
+    return viable;
+}
+
 void TextureCache::RecordEvictionReadbacks() {
     std::scoped_lock lock{mutex};
     ApplyReadyReadbacks();
@@ -232,26 +256,14 @@ void TextureCache::ApplyReadyReadbacks() {
             ++readback_stats.aborted_dirty;
             continue;
         }
-        // The guest range may also back GPU-written *buffers* (Bloodborne aliases vertex/effect
-        // buffers over image memory). Writing this image's tiled bytes over such a range and
-        // flushing the tracker makes the next buffer sync upload tiled texels into the vertex
-        // buffer: garbage positions under perfectly valid materials — Run 36's animated-ribbon
-        // explosion. Any buffer-side GPU-authored data in the range aborts the writeback.
+        // Revalidate the conditions that were checked at nomination; both alias classes can have
+        // appeared while the download was in flight (Run 36's vertex-buffer clobber came through
+        // exactly this window).
         if (buffer_cache.IsRegionGpuModified(readback.guest_address, readback.guest_size)) {
             ++readback_stats.aborted_buffer_alias;
             continue;
         }
-        // Likewise, another image aliasing this guest range may carry newer GPU-authored content;
-        // flushing the tracker under it would let a later sync upload these stale bytes over it.
-        bool aliased_newer = false;
-        ForEachImageInRegion(readback.guest_address, readback.guest_size,
-                             [&](ImageId other_id, Image& other) {
-                                 if (other_id != readback.image_id &&
-                                     True(other.flags & ImageFlagBits::GpuModified)) {
-                                     aliased_newer = true;
-                                 }
-                             });
-        if (aliased_newer) {
+        if (!IsReadbackViable(readback.image_id, image)) {
             ++readback_stats.aborted_image_alias;
             continue;
         }
@@ -260,6 +272,17 @@ void TextureCache::ApplyReadyReadbacks() {
                                                   readback.data.data(), readback.data.size());
         image.flags &= ~ImageFlagBits::GpuModified;
         buffer_cache.MarkRegionAsFlushed(readback.guest_address, readback.guest_size);
+        // Dominated aliases (older, fully contained) are superseded byte-for-byte by the written
+        // range. Their device copies are stale; make guest memory their source of truth too.
+        ForEachImageInRegion(readback.guest_address, readback.guest_size,
+                             [&](ImageId other_id, Image& other) {
+                                 if (other_id == readback.image_id ||
+                                     False(other.flags & ImageFlagBits::GpuModified)) {
+                                     return;
+                                 }
+                                 other.flags &= ~ImageFlagBits::GpuModified;
+                                 other.flags |= ImageFlagBits::CpuDirty;
+                             });
     }
 }
 
@@ -1207,7 +1230,8 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
                 image.info.pixel_format != vk::Format::eUndefined &&
                 image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4 &&
                 !buffer_cache.IsRegionGpuModified(image.info.guest_address,
-                                                  image.info.guest_size)) {
+                                                  image.info.guest_size) &&
+                IsReadbackViable(image_id, image)) {
                 image.flags |= ImageFlagBits::EvictionReadback;
                 eviction_readbacks.push_back(image_id);
                 ++readback_stats.nominated;

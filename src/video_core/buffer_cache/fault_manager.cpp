@@ -19,7 +19,7 @@ static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
 
 FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
                            BufferCache& buffer_cache_, u32 caching_pagebits, u64 caching_num_pages_)
-    : scheduler{scheduler_}, buffer_cache{buffer_cache_},
+    : instance{instance}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
       caching_pagesize{1ULL << caching_pagebits}, caching_num_pages{caching_num_pages_},
       fault_buffer_size{caching_num_pages_ / 8},
       fault_buffer{instance, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, fault_buffer_size},
@@ -147,6 +147,12 @@ void FaultManager::ProcessFaultBuffer() {
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::FaultParse,
+                              Vulkan::GpuCheckpointContext{
+                                  .group_x = num_workgroups,
+                                  .group_y = 1,
+                                  .group_z = 1,
+                              });
     cmdbuf.dispatch(num_workgroups, 1, 1);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
