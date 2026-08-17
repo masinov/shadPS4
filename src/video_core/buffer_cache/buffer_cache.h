@@ -51,6 +51,9 @@ class BufferCache {
 public:
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
+    /// Sparse buffer block size on every known implementation; sparse cache buffers are aligned
+    /// to it so blocks can be re-bound between buffers at identical guest addresses.
+    static constexpr u64 SPARSE_ALIGNMENT = 64_KB;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
     static constexpr u64 CACHING_NUMPAGES = u64{1} << (BdaAddressSpaceBits - CACHING_PAGEBITS);
     static constexpr u64 BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
@@ -260,7 +263,14 @@ private:
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size, u64 used_memory,
                                                 u64 total_budget);
 
-    void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id);
+    void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+                     std::vector<vk::SparseMemoryBind>& sparse_binds);
+
+    /// Writes device addresses for [offset, offset + size) of the buffer into the BDA page table.
+    void WriteBdaEntries(const Buffer& buffer, u64 offset, u64 size);
+
+    /// Sparse buffers: binds memory for a range about to be accessed and publishes its BDA.
+    void EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size);
 
     BufferId CreateBuffer(VAddr device_addr, u32 wanted_size, bool allow_texture_gc = true);
 
@@ -305,6 +315,7 @@ private:
     Buffer bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;
     u64 gc_tick = 0;
+    bool sparse_buffers{};
     u64 pressure_allocation_log_count{};
     u64 chain_advance_log_count{};
     u64 replacement_count{};

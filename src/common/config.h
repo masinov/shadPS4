@@ -243,6 +243,8 @@ int getExtraDmemInMbytes();
 void setExtraDmemInMbytes(int value);
 bool getUseHostMemoryFallback();
 void setUseHostMemoryFallback(bool enable);
+bool getUseSparseCacheBuffers();
+void setUseSparseCacheBuffers(bool enable);
 int getMemoryCompressionLevel();
 void setMemoryCompressionLevel(int level);
 bool getIsMotionControlsEnabled();

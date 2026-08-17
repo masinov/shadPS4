@@ -134,6 +134,11 @@ public:
     }
 
     /// Returns true if query pools can be reset from the host.
+    /// True when the buffer cache may back its buffers with sparse memory bindings.
+    bool IsSparseCacheBufferSupported() const noexcept {
+        return sparse_cache_buffers;
+    }
+
     bool IsHostQueryResetSupported() const {
         return vk12_features.hostQueryReset;
     }
@@ -590,6 +595,7 @@ private:
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     bool device_fault{};
+    bool sparse_cache_buffers{};
     bool device_address_binding_report{};
     bool diagnostic_checkpoints{};
     bool manage_imgui{true};

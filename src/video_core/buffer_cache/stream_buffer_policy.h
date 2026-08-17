@@ -23,6 +23,15 @@ constexpr u32 StreamGrowthLookahead = 4;
 // quarter of the fixed 16 MiB reserve.
 constexpr VAddr StreamGrowthProportionalMaximum = 64_MB;
 constexpr u32 StreamGrowthProportionShift = 3;
+// Sparse cache buffers bind reserve pages only when they are first touched, so their reserve costs
+// address space rather than memory: reserve as much as the buffer already holds (a full step of
+// geometric growth), bounded so a single buffer's address range stays reasonable.
+constexpr VAddr SparseStreamGrowthMaximum = 256_MB;
+
+[[nodiscard]] constexpr VAddr SparseStreamGrowthDistance(VAddr classic_distance,
+                                                         VAddr natural_size) noexcept {
+    return std::max(classic_distance, std::min(natural_size, SparseStreamGrowthMaximum));
+}
 
 struct StreamGrowthDirections {
     bool left;

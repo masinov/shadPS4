@@ -35,6 +35,7 @@ set(OBJECT_POOL_TEST_SOURCES
     video_core/test_memory_gc.cpp
     video_core/test_page_watcher_counter.cpp
     video_core/test_pending_operation_queue.cpp
+    video_core/test_sparse_coverage.cpp
     video_core/test_stream_buffer_policy.cpp
     video_core/test_submit_info.cpp
 )

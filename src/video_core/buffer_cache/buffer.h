@@ -12,6 +12,7 @@
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/buffer_cache/sparse_coverage.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -48,6 +49,17 @@ constexpr vk::BufferUsageFlags ReadFlags =
 constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+/// One contiguous memory range bound into a sparse buffer. Blocks are moved between buffers by
+/// aliasing (bind the same memory into the successor); only one buffer owns the allocation.
+struct SparseBlock {
+    VmaAllocation allocation{};
+    VkDeviceMemory memory{};
+    VkDeviceSize memory_offset{};
+    VkDeviceSize buffer_offset{};
+    VkDeviceSize size{};
+    bool owned{};
+};
+
 struct UniqueBuffer {
     explicit UniqueBuffer(vk::Device device, VmaAllocator allocator);
     ~UniqueBuffer();
@@ -60,7 +72,17 @@ struct UniqueBuffer {
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
-          bda_addr{std::exchange(other.bda_addr, 0)} {}
+          bda_addr{std::exchange(other.bda_addr, 0)},
+          is_sparse{std::exchange(other.is_sparse, false)},
+          sparse_block_size{std::exchange(other.sparse_block_size, 0)},
+          sparse_memory_type_bits{std::exchange(other.sparse_memory_type_bits, 0)},
+          sparse_size{std::exchange(other.sparse_size, 0)},
+          sparse_bound_bytes{std::exchange(other.sparse_bound_bytes, 0)},
+          sparse_blocks{std::move(other.sparse_blocks)},
+          sparse_coverage{std::move(other.sparse_coverage)} {
+        other.sparse_blocks.clear();
+        other.sparse_coverage.Clear();
+    }
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this == &other) {
             return *this;
@@ -71,6 +93,15 @@ struct UniqueBuffer {
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
         bda_addr = std::exchange(other.bda_addr, 0);
+        is_sparse = std::exchange(other.is_sparse, false);
+        sparse_block_size = std::exchange(other.sparse_block_size, 0);
+        sparse_memory_type_bits = std::exchange(other.sparse_memory_type_bits, 0);
+        sparse_size = std::exchange(other.sparse_size, 0);
+        sparse_bound_bytes = std::exchange(other.sparse_bound_bytes, 0);
+        sparse_blocks = std::move(other.sparse_blocks);
+        sparse_coverage = std::move(other.sparse_coverage);
+        other.sparse_blocks.clear();
+        other.sparse_coverage.Clear();
         return *this;
     }
 
@@ -79,6 +110,31 @@ struct UniqueBuffer {
     void Create(const vk::BufferCreateInfo& image_ci, MemoryUsage usage,
                 VmaAllocationInfo* out_alloc_info,
                 const std::function<void()>& allocation_failure_callback = {});
+
+    /// Creates a sparse-resident buffer with no memory bound. Memory is bound on demand with
+    /// BindRange and inherited from replaced buffers with TakeOverBlocks.
+    void CreateSparse(const vk::BufferCreateInfo& buffer_ci);
+
+    /// Allocates and records bindings for every part of [offset, offset + size) that has no
+    /// memory yet. Appends the Vulkan bind operations to out_binds (the caller submits them) and
+    /// returns the number of bytes newly bound.
+    u64 BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage,
+                  const std::function<void()>& allocation_failure_callback,
+                  std::vector<vk::SparseMemoryBind>& out_binds);
+
+    /// Aliases every block of `other` into this buffer at (block offset + delta) and takes over
+    /// ownership of the allocations. `other` keeps its bindings, so commands already recorded
+    /// against it stay valid until it is retired.
+    void TakeOverBlocks(UniqueBuffer& other, s64 delta,
+                        std::vector<vk::SparseMemoryBind>& out_binds);
+
+    [[nodiscard]] bool IsRangeBound(VkDeviceSize offset, VkDeviceSize size) const noexcept;
+
+    /// Calls func(offset, size) for each maximal contiguous bound range (adjacent blocks merged).
+    template <typename Func>
+    void ForEachBoundRange(Func&& func) const {
+        sparse_coverage.ForEach(std::forward<Func>(func));
+    }
 
     operator vk::Buffer() const {
         return buffer;
@@ -89,14 +145,52 @@ struct UniqueBuffer {
     VmaAllocation allocation;
     vk::Buffer buffer{};
     vk::DeviceAddress bda_addr = 0;
+    bool is_sparse{};
+    VkDeviceSize sparse_block_size{};
+    u32 sparse_memory_type_bits{};
+    VkDeviceSize sparse_size{};
+    VkDeviceSize sparse_bound_bytes{};
+    std::vector<SparseBlock> sparse_blocks; ///< Sorted by buffer_offset, non-overlapping.
+    /// Coalesced bound ranges; range queries use this so a buffer that accumulated many small
+    /// demand bindings stays cheap to check.
+    SparseCoverage sparse_coverage;
 };
 
 class Buffer {
 public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                     MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_,
-                    const std::function<void()>& allocation_failure_callback = {});
+                    const std::function<void()>& allocation_failure_callback = {},
+                    bool sparse = false);
     ~Buffer();
+
+    /// True when the buffer is sparse-resident: memory is bound per range on demand.
+    [[nodiscard]] bool IsSparse() const noexcept {
+        return buffer.is_sparse;
+    }
+
+    /// Sparse buffers only. Binds memory for [offset, offset + size) where missing; the bind
+    /// operations are appended to out_binds for the caller to submit. Returns bytes newly bound.
+    u64 EnsureBound(u64 offset, u64 size, const std::function<void()>& allocation_failure_callback,
+                    std::vector<vk::SparseMemoryBind>& out_binds) {
+        const u64 bound =
+            buffer.BindRange(offset, size, usage, allocation_failure_callback, out_binds);
+        allocation_size = buffer.sparse_bound_bytes;
+        return bound;
+    }
+
+    /// Sparse buffers only. Inherits every memory block of `other` (a buffer this one replaces)
+    /// by aliasing it at the matching guest address.
+    void TakeOverBlocks(Buffer& other, std::vector<vk::SparseMemoryBind>& out_binds) {
+        const s64 delta = static_cast<s64>(other.cpu_addr) - static_cast<s64>(cpu_addr);
+        buffer.TakeOverBlocks(other.buffer, delta, out_binds);
+        allocation_size = buffer.sparse_bound_bytes;
+        other.allocation_size = other.buffer.sparse_bound_bytes;
+    }
+
+    [[nodiscard]] bool IsRangeBound(u64 offset, u64 size) const noexcept {
+        return !buffer.is_sparse || buffer.IsRangeBound(offset, size);
+    }
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;

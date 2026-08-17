@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/config.h"
@@ -69,11 +71,180 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() noexcept {
+    if (is_sparse) {
+        if (buffer) {
+            device.destroyBuffer(buffer);
+        }
+        // Blocks that were handed to a successor (aliased) are freed by that successor.
+        for (const SparseBlock& block : sparse_blocks) {
+            if (block.owned && block.allocation) {
+                vmaFreeMemory(allocator, block.allocation);
+            }
+        }
+        sparse_blocks.clear();
+        sparse_coverage.Clear();
+        sparse_bound_bytes = 0;
+        buffer = VK_NULL_HANDLE;
+        bda_addr = 0;
+        is_sparse = false;
+        return;
+    }
     if (buffer) {
         vmaDestroyBuffer(allocator, buffer, allocation);
         buffer = VK_NULL_HANDLE;
         allocation = VK_NULL_HANDLE;
         bda_addr = 0;
+    }
+}
+
+void UniqueBuffer::CreateSparse(const vk::BufferCreateInfo& buffer_ci_in) {
+    vk::BufferCreateInfo buffer_ci = buffer_ci_in;
+    buffer_ci.flags |= vk::BufferCreateFlagBits::eSparseBinding |
+                       vk::BufferCreateFlagBits::eSparseResidency |
+                       vk::BufferCreateFlagBits::eSparseAliased;
+    auto [result, created] = device.createBuffer(buffer_ci);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed creating sparse buffer: {}",
+               vk::to_string(result));
+    buffer = created;
+    is_sparse = true;
+    sparse_size = buffer_ci.size;
+    allocation = VK_NULL_HANDLE;
+
+    const vk::MemoryRequirements requirements = device.getBufferMemoryRequirements(buffer);
+    sparse_block_size = requirements.alignment;
+    sparse_memory_type_bits = requirements.memoryTypeBits;
+    ASSERT_MSG(sparse_block_size != 0 && (sparse_block_size & (sparse_block_size - 1)) == 0 &&
+                   sparse_block_size <= 64_KB,
+               "Unexpected sparse block size {}", sparse_block_size);
+
+    if (buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+        const vk::BufferDeviceAddressInfo bda_info{.buffer = buffer};
+        bda_addr = device.getBufferAddress(bda_info);
+        ASSERT_MSG(bda_addr != 0, "Failed to get sparse buffer device address");
+    }
+}
+
+bool UniqueBuffer::IsRangeBound(VkDeviceSize offset, VkDeviceSize size) const noexcept {
+    const VkDeviceSize end = std::min<VkDeviceSize>(offset + size, sparse_size);
+    return end <= offset || sparse_coverage.Contains(offset, end - offset);
+}
+
+u64 UniqueBuffer::BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage,
+                            const std::function<void()>& allocation_failure_callback,
+                            std::vector<vk::SparseMemoryBind>& out_binds) {
+    ASSERT(is_sparse);
+    if (size == 0) {
+        return 0;
+    }
+    // Bindings are made in whole sparse blocks inside the buffer.
+    const VkDeviceSize begin = Common::AlignDown(offset, sparse_block_size);
+    const VkDeviceSize end =
+        std::min<VkDeviceSize>(Common::AlignUp(offset + size, sparse_block_size), sparse_size);
+    if (begin >= end) {
+        return 0;
+    }
+
+    // Collect the gaps of [begin, end) that have no memory.
+    boost::container::small_vector<std::pair<VkDeviceSize, VkDeviceSize>, 8> gaps;
+    sparse_coverage.ForEachGap(
+        begin, end, [&](u64 gap_begin, u64 gap_end) { gaps.emplace_back(gap_begin, gap_end); });
+
+    u64 newly_bound = 0;
+    for (const auto& [gap_begin, gap_end] : gaps) {
+        const VkDeviceSize gap_size = gap_end - gap_begin;
+        const VkMemoryRequirements requirements = {
+            .size = gap_size,
+            .alignment = sparse_block_size,
+            .memoryTypeBits = sparse_memory_type_bits,
+        };
+        VmaAllocationCreateInfo alloc_ci = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .usage = VMA_MEMORY_USAGE_UNKNOWN,
+            .requiredFlags = 0,
+            .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            .pool = VK_NULL_HANDLE,
+            .pUserData = nullptr,
+        };
+        VmaAllocation block_allocation{};
+        VmaAllocationInfo info{};
+        VkResult result =
+            vmaAllocateMemory(allocator, &requirements, &alloc_ci, &block_allocation, &info);
+        if ((result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
+            allocation_failure_callback) {
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse block allocation of {} bytes failed within the reported memory "
+                        "budget; running emergency garbage collection before retrying",
+                        gap_size);
+            allocation_failure_callback();
+            result =
+                vmaAllocateMemory(allocator, &requirements, &alloc_ci, &block_allocation, &info);
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            const bool use_host_fallback =
+                Config::getUseHostMemoryFallback() &&
+                (usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream);
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse block allocation of {} bytes failed within the reported memory "
+                        "budget; retrying without the budget restriction{}",
+                        gap_size, use_host_fallback ? " with host memory fallback" : "");
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            if (use_host_fallback) {
+                alloc_ci.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            }
+            result =
+                vmaAllocateMemory(allocator, &requirements, &alloc_ci, &block_allocation, &info);
+        }
+        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating sparse block of {} bytes: {}", gap_size,
+                   vk::to_string(vk::Result{result}));
+
+        SparseBlock block{
+            .allocation = block_allocation,
+            .memory = info.deviceMemory,
+            .memory_offset = info.offset,
+            .buffer_offset = gap_begin,
+            .size = gap_size,
+            .owned = true,
+        };
+        const auto insert_at =
+            std::ranges::upper_bound(sparse_blocks, gap_begin, {}, &SparseBlock::buffer_offset);
+        sparse_blocks.insert(insert_at, block);
+        sparse_coverage.Add(gap_begin, gap_size);
+        sparse_bound_bytes += gap_size;
+        newly_bound += gap_size;
+        out_binds.push_back(vk::SparseMemoryBind{
+            .resourceOffset = gap_begin,
+            .size = gap_size,
+            .memory = info.deviceMemory,
+            .memoryOffset = info.offset,
+        });
+    }
+    return newly_bound;
+}
+
+void UniqueBuffer::TakeOverBlocks(UniqueBuffer& other, s64 delta,
+                                  std::vector<vk::SparseMemoryBind>& out_binds) {
+    ASSERT(is_sparse && other.is_sparse);
+    for (SparseBlock& block : other.sparse_blocks) {
+        const s64 new_offset = static_cast<s64>(block.buffer_offset) + delta;
+        ASSERT_MSG(new_offset >= 0 &&
+                       static_cast<VkDeviceSize>(new_offset) + block.size <= sparse_size,
+                   "Sparse block [{:#x},{:#x}) does not fit the successor of size {:#x} (delta {})",
+                   block.buffer_offset, block.buffer_offset + block.size, sparse_size, delta);
+        SparseBlock taken = block;
+        taken.buffer_offset = static_cast<VkDeviceSize>(new_offset);
+        taken.owned = block.owned;
+        block.owned = false;
+        const auto insert_at = std::ranges::upper_bound(sparse_blocks, taken.buffer_offset, {},
+                                                        &SparseBlock::buffer_offset);
+        sparse_blocks.insert(insert_at, taken);
+        sparse_coverage.Add(taken.buffer_offset, taken.size);
+        sparse_bound_bytes += taken.size;
+        out_binds.push_back(vk::SparseMemoryBind{
+            .resourceOffset = taken.buffer_offset,
+            .size = taken.size,
+            .memory = taken.memory,
+            .memoryOffset = taken.memory_offset,
+        });
     }
 }
 
@@ -147,7 +318,7 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_,
-               const std::function<void()>& allocation_failure_callback)
+               const std::function<void()>& allocation_failure_callback, bool sparse)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
     // Create buffer object.
@@ -155,6 +326,15 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         .size = size_bytes,
         .usage = flags,
     };
+    if (sparse) {
+        buffer.CreateSparse(buffer_ci);
+        allocation_size = 0;
+        address_generation = instance->TrackBufferAddress(buffer.bda_addr, size_bytes, cpu_addr,
+                                                          allocation_size, static_cast<u32>(usage));
+        Vulkan::SetObjectName(instance->GetDevice(), Handle(), "SparseBuffer {:#x}:{:#x}", cpu_addr,
+                              size_bytes);
+        return;
+    }
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, usage, &alloc_info, allocation_failure_callback);
     allocation_size = alloc_info.size;

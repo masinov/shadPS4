@@ -170,6 +170,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
+    if (sparse_bind_pending) {
+        // Sparse binding operations complete asynchronously with respect to later submissions;
+        // the command buffer recorded since the last bind must not start before they finish.
+        info.AddWait(*sparse_bind_semaphore, sparse_bind_value,
+                     vk::PipelineStageFlagBits::eAllCommands);
+        sparse_bind_pending = false;
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -242,6 +249,55 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                     elapsed_ms(queue_end, refresh_end), elapsed_ms(refresh_end, allocate_end),
                     elapsed_ms(allocate_end, pending_end), executed_pending_operations);
     }
+}
+
+void Scheduler::BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds) {
+    if (binds.empty()) {
+        return;
+    }
+    if (!sparse_bind_semaphore) {
+        const vk::StructureChain semaphore_chain = {
+            vk::SemaphoreCreateInfo{},
+            vk::SemaphoreTypeCreateInfo{
+                .semaphoreType = vk::SemaphoreType::eTimeline,
+                .initialValue = 0,
+            },
+        };
+        auto [result, semaphore] =
+            instance.GetDevice().createSemaphoreUnique(semaphore_chain.get());
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create sparse bind semaphore: {}",
+                   vk::to_string(result));
+        sparse_bind_semaphore = std::move(semaphore);
+    }
+    const u64 signal_value = ++sparse_bind_value;
+    const vk::SparseBufferMemoryBindInfo buffer_bind = {
+        .buffer = buffer,
+        .bindCount = static_cast<u32>(binds.size()),
+        .pBinds = binds.data(),
+    };
+    const vk::Semaphore semaphore = *sparse_bind_semaphore;
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &signal_value,
+    };
+    const vk::BindSparseInfo bind_info = {
+        .pNext = &timeline_info,
+        .bufferBindCount = 1,
+        .pBufferBinds = &buffer_bind,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &semaphore,
+    };
+    vk::Result result;
+    {
+        SubmitLock lk{SubmitCriticalPhase::SparseBind};
+        result = instance.GetGraphicsQueue().bindSparse(bind_info, VK_NULL_HANDLE);
+    }
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceLoss("sparse memory binding");
+    }
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to bind sparse buffer memory: {}",
+               vk::to_string(result));
+    sparse_bind_pending = true;
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

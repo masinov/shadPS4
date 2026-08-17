@@ -47,6 +47,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    sparse_buffers = instance.IsSparseCacheBufferSupported();
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 }
@@ -672,17 +673,23 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             ? DetermineStreamGrowth(requested_begin, requested_end, overlap_begin, overlap_span_end)
             : StreamGrowthDirections{};
     const VAddr natural_size = natural_end - natural_begin;
-    const VAddr right_growth =
+    VAddr right_growth =
         growth.right ? DetermineStreamGrowthDistance(wanted_size, requested_end - overlap_span_end,
                                                      natural_size)
                      : 0;
-    const VAddr left_growth =
+    VAddr left_growth =
         growth.left ? DetermineStreamGrowthDistance(wanted_size, overlap_begin - requested_begin,
                                                     natural_size)
                     : 0;
+    if (sparse_buffers) {
+        // Unbound reserve pages cost no memory, so a streaming buffer can reserve a full growth
+        // step ahead and is never suppressed by memory pressure.
+        right_growth = growth.right ? SparseStreamGrowthDistance(right_growth, natural_size) : 0;
+        left_growth = growth.left ? SparseStreamGrowthDistance(left_growth, natural_size) : 0;
+    }
     const u64 desired_stream_growth = left_growth + right_growth;
     const bool stream_growth_suppressed =
-        stream_growth_candidate && desired_stream_growth != 0 &&
+        !sparse_buffers && stream_growth_candidate && desired_stream_growth != 0 &&
         !ShouldReserveStreamGrowth(used_memory, total_budget, natural_end - natural_begin,
                                    desired_stream_growth);
     has_stream_leap =
@@ -731,9 +738,21 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
     };
 }
 
-void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id) {
+void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+                              std::vector<vk::SparseMemoryBind>& sparse_binds) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
+    if (new_buffer.IsSparse()) {
+        // No copy: the replacement aliases the memory blocks of the buffer it absorbs at the
+        // matching guest addresses and takes over their ownership. The old buffer keeps its own
+        // bindings until it is retired at its last-use tick, so commands already recorded against
+        // it stay valid; the caller submits the bind operations once for the whole replacement.
+        new_buffer.TakeOverBlocks(overlap, sparse_binds);
+        MarkBufferUsed(overlap);
+        MarkBufferUsed(new_buffer);
+        DeleteBuffer(overlap_id);
+        return;
+    }
     const size_t dst_base_offset = overlap.CpuAddr() - new_buffer.CpuAddr();
     const vk::BufferCopy copy = {
         .srcOffset = 0,
@@ -796,13 +815,21 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id) {
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allow_texture_gc) {
     const VAddr requested_addr = device_addr;
     const u32 requested_size = wanted_size;
-    const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
-    device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+    // Sparse cache buffers move memory blocks between buffers by rebinding them at the same guest
+    // address, so every buffer base and size must be a multiple of the sparse block size.
+    const u64 alignment = sparse_buffers ? SPARSE_ALIGNMENT : CACHING_PAGESIZE;
+    const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, alignment);
+    device_addr = Common::AlignDown(device_addr, alignment);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     u64 used_memory = instance.GetDeviceMemoryUsage();
     const u64 total_budget = instance.GetTotalMemoryBudget();
-    const OverlapResult overlap =
-        ResolveOverlaps(device_addr, wanted_size, used_memory, total_budget);
+    OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size, used_memory, total_budget);
+    if (sparse_buffers) {
+        // All cache buffers are sparse-aligned, so widening to the alignment cannot reach into a
+        // buffer that the overlap scan did not already select.
+        overlap.begin = Common::AlignDown(overlap.begin, SPARSE_ALIGNMENT);
+        overlap.end = Common::AlignUp(overlap.end, SPARSE_ALIGNMENT);
+    }
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
 
     u64 overlap_bytes{};
@@ -828,7 +855,10 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     // range it belonged to. Bound that total by submitting once it would exceed the allocator's
     // headroom; a submission costs far less than the emergency reclaim it prevents.
     const u64 chain_deferred_before = replacement_chain_deferred_bytes;
+    // Sparse replacements alias the absorbed memory instead of copying it, so no extra storage
+    // is retained until the tick completes; the chain-breaking submission is a copy-model measure.
     const bool chain_advanced =
+        !sparse_buffers &&
         ShouldAdvanceReplacementChain(chain_deferred_before, overlap_bytes, total_budget);
     if (chain_advanced) {
         scheduler.Flush();
@@ -846,39 +876,66 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     const bool sample_chain =
         chain_advanced && ShouldLogDiagnosticSample(++chain_advance_log_count);
     ++replacement_count;
-    if (size >= 64_MB || sample_pressure || sample_chain) {
+    // Sparse buffers bind only the requested pages now; the rest of the range is address space.
+    const u64 allocation_bytes = sparse_buffers ? wanted_size : size;
+    if (allocation_bytes >= 64_MB || sample_pressure || sample_chain) {
         LOG_INFO(Render_Vulkan,
                  "Cache buffer allocation: request=[{:#x},{:#x}) ({} bytes), "
                  "resolved=[{:#x},{:#x}) ({} bytes), overlaps={} ({} bytes, largest {}), "
                  "stream_leap={}, usage={} MiB, budget={} MiB, pressure_sample={}, "
                  "stream_suppressed={}, desired_growth={} bytes, speculative={} bytes, "
-                 "chain_advanced={}, tick_deferred={} bytes, replacements={}",
+                 "chain_advanced={}, tick_deferred={} bytes, replacements={}, sparse={}",
                  requested_addr, requested_addr + requested_size, requested_size, overlap.begin,
                  overlap.end, size, overlap.ids.size(), overlap_bytes, largest_overlap,
                  overlap.has_stream_leap, used_memory / 1_MB, total_budget / 1_MB, sample_pressure,
                  overlap.stream_growth_suppressed, overlap.desired_stream_growth,
                  overlap.speculative_bytes, chain_advanced, chain_deferred_before,
-                 replacement_count);
+                 replacement_count, sparse_buffers);
     }
 
-    ReclaimForAllocation(size, false, allow_texture_gc);
+    ReclaimForAllocation(allocation_bytes, false, allow_texture_gc);
     std::function<void()> allocation_failure_callback;
     if (allocation_reclaim_callback) {
-        allocation_failure_callback = [this, size, allow_texture_gc] {
-            ReclaimForAllocation(size, true, allow_texture_gc);
+        allocation_failure_callback = [this, allocation_bytes, allow_texture_gc] {
+            ReclaimForAllocation(allocation_bytes, true, allow_texture_gc);
         };
     }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
-                            allocation_failure_callback);
+                            allocation_failure_callback, sparse_buffers);
     auto& new_buffer = slot_buffers[new_buffer_id];
     // The allocation was created to satisfy work being recorded now. Initializing its lifetime
     // here prevents a zero last-use tick from ever being interpreted as completed by a later
     // allocation-driven collection in the same command buffer.
     MarkBufferUsed(new_buffer);
+    std::vector<vk::SparseMemoryBind> sparse_binds;
     for (const BufferId overlap_id : overlap.ids) {
-        JoinOverlap(new_buffer_id, overlap_id);
+        JoinOverlap(new_buffer_id, overlap_id, sparse_binds);
+    }
+    if (sparse_buffers) {
+        // Inherited blocks cover the absorbed buffers; the pages of the request itself may still be
+        // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the
+        // request stay unbound until they are first touched.
+        new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size,
+                               allocation_failure_callback, sparse_binds);
+        scheduler.BindSparse(new_buffer.Handle(), sparse_binds);
+        if (!overlap.ids.empty()) {
+            // Writes made through the retired handles must be visible through the aliasing one.
+            scheduler.EndRendering();
+            const vk::MemoryBarrier2 alias_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            };
+            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &alias_barrier,
+            });
+        }
     }
     const u64 replacement_tick = scheduler.CurrentTick();
     if (replacement_chain_tick != replacement_tick) {
@@ -964,14 +1021,14 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     }
     if constexpr (insert) {
         buffer.SetLRUId(lru_cache.Insert(buffer_id, gc_tick));
-        boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
-        bda_addrs.reserve(size_pages);
-        for (u64 i = 0; i < size_pages; ++i) {
-            vk::DeviceAddress addr = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
-            bda_addrs.push_back(addr);
+        if (buffer.IsSparse()) {
+            // Only bound ranges have a valid device address; unbound reserve pages keep a null
+            // entry so direct-memory shaders take the fault path, which binds them.
+            buffer.buffer.ForEachBoundRange(
+                [&](u64 offset, u64 range_size) { WriteBdaEntries(buffer, offset, range_size); });
+        } else {
+            WriteBdaEntries(buffer, 0, buffer.SizeBytes());
         }
-        WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
-                        bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
         buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
     } else {
         lru_cache.Free(buffer.LRUId());
@@ -980,12 +1037,57 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
         buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
     }
 }
+void BufferCache::WriteBdaEntries(const Buffer& buffer, u64 offset, u64 size) {
+    const VAddr range_begin = buffer.CpuAddr() + offset;
+    const u64 page_begin = range_begin >> CACHING_PAGEBITS;
+    const u64 page_end = Common::DivCeil(range_begin + size, CACHING_PAGESIZE);
+    const u64 size_pages = page_end - page_begin;
+    boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
+    bda_addrs.reserve(size_pages);
+    const vk::DeviceAddress base =
+        buffer.BufferDeviceAddress() + ((page_begin << CACHING_PAGEBITS) - buffer.CpuAddr());
+    for (u64 i = 0; i < size_pages; ++i) {
+        bda_addrs.push_back(base + (i << CACHING_PAGEBITS));
+    }
+    WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress), bda_addrs.data(),
+                    bda_addrs.size() * sizeof(vk::DeviceAddress));
+}
+
+void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) {
+    if (!buffer.IsSparse()) {
+        return;
+    }
+    const u64 offset = buffer.Offset(device_addr);
+    if (buffer.IsRangeBound(offset, size)) {
+        return;
+    }
+    // Demand binding of reserve pages is an allocation like any other: keep it inside the
+    // budget. Texture collection is avoided because this can run under the texture cache mutex.
+    ReclaimForAllocation(size, false, false);
+    std::function<void()> allocation_failure_callback;
+    if (allocation_reclaim_callback) {
+        allocation_failure_callback = [this, size] { ReclaimForAllocation(size, true, false); };
+    }
+    std::vector<vk::SparseMemoryBind> sparse_binds;
+    buffer.EnsureBound(offset, size, allocation_failure_callback, sparse_binds);
+    if (sparse_binds.empty()) {
+        return;
+    }
+    scheduler.BindSparse(buffer.Handle(), sparse_binds);
+    // Only registered buffers reach this path (every caller resolved the buffer through the page
+    // table first), so the new pages can be published to direct-memory shaders immediately.
+    for (const vk::SparseMemoryBind& bind : sparse_binds) {
+        WriteBdaEntries(buffer, bind.resourceOffset, bind.size);
+    }
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
     // Synchronization is always followed by a GPU access to this cache buffer, even when the
     // memory tracker finds no dirty CPU pages and therefore emits no upload. This is especially
     // important for direct-memory shaders, which dereference the BDA page table at execution time.
     MarkBufferUsed(buffer);
+    EnsureRangeBound(buffer, device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -1308,7 +1410,8 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
         const VAddr address = buffer.CpuAddr();
         const u64 guest_size = buffer.SizeBytes();
         const u64 allocation_size = buffer.AllocationSizeBytes();
-        ASSERT_MSG(allocation_size != 0, "Tracked buffer has no physical allocation");
+        ASSERT_MSG(allocation_size != 0 || buffer.IsSparse(),
+                   "Tracked buffer has no physical allocation");
 
         if (IsResourceInFlight(buffer.LastUseTick(), scheduler.CurrentTick())) {
             ++result.skipped_in_flight;

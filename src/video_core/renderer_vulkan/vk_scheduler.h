@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <string_view>
 #include <thread>
 #include <queue>
@@ -56,11 +57,11 @@ struct RenderState {
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
 struct SubmitInfo {
-    std::array<vk::Semaphore, 3> wait_semas;
-    std::array<u64, 3> wait_ticks;
-    std::array<vk::PipelineStageFlags, 3> wait_stage_masks;
-    std::array<vk::Semaphore, 3> signal_semas;
-    std::array<u64, 3> signal_ticks;
+    std::array<vk::Semaphore, 4> wait_semas;
+    std::array<u64, 4> wait_ticks;
+    std::array<vk::PipelineStageFlags, 4> wait_stage_masks;
+    std::array<vk::Semaphore, 4> signal_semas;
+    std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
@@ -359,6 +360,7 @@ enum class SubmitCriticalPhase : u8 {
     QueueSubmit,
     Present,
     SwapchainRecreate,
+    SparseBind,
 };
 
 [[nodiscard]] constexpr std::string_view SubmitCriticalPhaseName(SubmitCriticalPhase phase) {
@@ -373,6 +375,8 @@ enum class SubmitCriticalPhase : u8 {
         return "present";
     case SubmitCriticalPhase::SwapchainRecreate:
         return "swapchain_recreate";
+    case SubmitCriticalPhase::SparseBind:
+        return "sparse_bind";
     }
     return "unknown";
 }
@@ -456,6 +460,10 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// Queues sparse memory binds on the graphics queue. The next submission of this scheduler
+    /// waits for them, so bound memory is visible to every command recorded from now on.
+    void BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds);
+
     static std::mutex submit_mutex;
 
     /// Publishes the phase executed by the current holder of submit_mutex.
@@ -523,6 +531,9 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+    vk::UniqueSemaphore sparse_bind_semaphore;
+    u64 sparse_bind_value{};
+    bool sparse_bind_pending{};
 };
 
 } // namespace Vulkan

@@ -7,6 +7,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
@@ -696,6 +697,11 @@ bool Instance::CreateDevice() {
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,
+                // Sparse cache buffers replace copy-based buffer merges by binding the same memory
+                // blocks into the replacement buffer (aliased) and binding new blocks on demand.
+                .sparseBinding = features.sparseBinding,
+                .sparseResidencyBuffer = features.sparseResidencyBuffer,
+                .sparseResidencyAliased = features.sparseResidencyAliased,
             },
         },
         vk::PhysicalDeviceVulkan11Features{
@@ -869,6 +875,20 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    sparse_cache_buffers =
+        features.sparseBinding && features.sparseResidencyBuffer &&
+        features.sparseResidencyAliased &&
+        (family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding) &&
+        Config::getUseSparseCacheBuffers();
+    LOG_INFO(
+        Render_Vulkan,
+        "Sparse cache buffers: {} (sparseBinding={}, residencyBuffer={}, aliased={}, "
+        "queue sparse={}, address space {} GiB, config={})",
+        sparse_cache_buffers ? "enabled" : "disabled", features.sparseBinding,
+        features.sparseResidencyBuffer, features.sparseResidencyAliased,
+        bool(family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding),
+        properties.limits.sparseAddressSpaceSize >> 30, Config::getUseSparseCacheBuffers());
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, dedicated_present_queue ? 1 : 0);

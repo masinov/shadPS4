@@ -249,6 +249,7 @@ static ConfigEntry<OpenALHrtfMode> openALHrtfMode(OpenALHrtfMode::HrtfAuto);
 static ConfigEntry<string> openALMainOutputDevice("Default Device");
 static ConfigEntry<int> extraDmemInMbytes(0);
 static ConfigEntry<bool> useHostMemoryFallback(false);
+static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<int> memoryCompressionLevel(0);
 static ConfigEntry<int> usbDeviceBackend(UsbBackendType::Real);
 static ConfigEntry<s32> cameraId(-1);
@@ -604,6 +605,14 @@ bool getUseHostMemoryFallback() {
 
 void setUseHostMemoryFallback(bool enable) {
     useHostMemoryFallback.base_value = enable;
+}
+
+bool getUseSparseCacheBuffers() {
+    return useSparseCacheBuffers.get();
+}
+
+void setUseSparseCacheBuffers(bool enable) {
+    useSparseCacheBuffers.base_value = enable;
 }
 
 int getMemoryCompressionLevel() {
@@ -1904,6 +1913,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         muteEnabled.setFromToml(general, "muteEnabled", is_game_specific);
         extraDmemInMbytes.setFromToml(general, "extraDmemInMbytes", is_game_specific);
         useHostMemoryFallback.setFromToml(general, "useHostMemoryFallback", is_game_specific);
+        useSparseCacheBuffers.setFromToml(general, "useSparseCacheBuffers", is_game_specific);
         memoryCompressionLevel.setFromToml(general, "memoryCompressionLevel", is_game_specific);
         isNeo.setFromToml(general, "isPS4Pro", is_game_specific);
         isDevKit.setFromToml(general, "isDevKit", is_game_specific);
@@ -2330,6 +2340,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
             extraDmemInMbytes.game_specific_value.value_or(extraDmemInMbytes.base_value);
         data["General"]["useHostMemoryFallback"] =
             useHostMemoryFallback.game_specific_value.value_or(useHostMemoryFallback.base_value);
+        data["General"]["useSparseCacheBuffers"] =
+            useSparseCacheBuffers.game_specific_value.value_or(useSparseCacheBuffers.base_value);
         data["General"]["memoryCompressionLevel"] =
             memoryCompressionLevel.game_specific_value.value_or(memoryCompressionLevel.base_value);
         data["General"]["isShadNetEnabled"] =
@@ -2383,6 +2395,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["isDevKit"] = isDevKit.base_value;
         data["General"]["extraDmemInMbytes"] = extraDmemInMbytes.base_value;
         data["General"]["useHostMemoryFallback"] = useHostMemoryFallback.base_value;
+        data["General"]["useSparseCacheBuffers"] = useSparseCacheBuffers.base_value;
         data["General"]["memoryCompressionLevel"] = memoryCompressionLevel.base_value;
         data["General"]["isShadNetEnabled"] = isShadNetEnabled.base_value;
         data["General"]["isTrophyPopupDisabled"] = isTrophyPopupDisabled.base_value;
@@ -2773,6 +2786,7 @@ void setDefaultValues() {
     isNeo = false;
     isDevKit = false;
     useHostMemoryFallback = false;
+    useSparseCacheBuffers = false;
     memoryCompressionLevel = 0;
     extraDmemInMbytes = 0;
 
