@@ -464,6 +464,16 @@ public:
     /// waits for them, so bound memory is visible to every command recorded from now on.
     void BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds);
 
+    struct SparseBindStatistics {
+        u64 count{};
+        u64 total_ms{};
+        u64 max_ms{};
+    };
+
+    [[nodiscard]] SparseBindStatistics GetSparseBindStatistics() const noexcept {
+        return sparse_bind_stats;
+    }
+
     static std::mutex submit_mutex;
 
     /// Publishes the phase executed by the current holder of submit_mutex.
@@ -534,6 +544,7 @@ private:
     vk::UniqueSemaphore sparse_bind_semaphore;
     u64 sparse_bind_value{};
     bool sparse_bind_pending{};
+    SparseBindStatistics sparse_bind_stats{};
 };
 
 } // namespace Vulkan

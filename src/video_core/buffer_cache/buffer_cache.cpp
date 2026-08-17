@@ -876,6 +876,15 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     const bool sample_chain =
         chain_advanced && ShouldLogDiagnosticSample(++chain_advance_log_count);
     ++replacement_count;
+    ++stats.replacements;
+    if (overlap.ids.empty()) {
+        ++stats.replacements_new;
+    } else if (overlap.ids.size() == 1) {
+        ++stats.replacements_grow;
+    } else {
+        ++stats.replacements_bridge;
+    }
+    stats.replaced_bytes += overlap_bytes;
     // Sparse buffers bind only the requested pages now; the rest of the range is address space.
     const u64 allocation_bytes = sparse_buffers ? wanted_size : size;
     if (allocation_bytes >= 64_MB || sample_pressure || sample_chain) {
@@ -1069,10 +1078,12 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
         allocation_failure_callback = [this, size] { ReclaimForAllocation(size, true, false); };
     }
     std::vector<vk::SparseMemoryBind> sparse_binds;
-    buffer.EnsureBound(offset, size, allocation_failure_callback, sparse_binds);
+    const u64 bound = buffer.EnsureBound(offset, size, allocation_failure_callback, sparse_binds);
     if (sparse_binds.empty()) {
         return;
     }
+    ++stats.demand_bindings;
+    stats.demand_bound_bytes += bound;
     scheduler.BindSparse(buffer.Handle(), sparse_binds);
     // Only registered buffers reach this path (every caller resolved the buffer through the page
     // table first), so the new pages can be published to direct-memory shaders immediately.
@@ -1482,6 +1493,20 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
         ++result.evicted_objects;
     }
     return result;
+}
+
+BufferCache::Statistics BufferCache::GetStatistics() {
+    Statistics snapshot = stats;
+    snapshot.sparse = sparse_buffers;
+    snapshot.live_buffers = 0;
+    snapshot.bound_bytes = 0;
+    lru_cache.ForEachItemBelow(std::numeric_limits<u64>::max(), [&](BufferId id) {
+        if (!IsBufferInvalid(id)) {
+            ++snapshot.live_buffers;
+            snapshot.bound_bytes += slot_buffers[id].AllocationSizeBytes();
+        }
+    });
+    return snapshot;
 }
 
 void BufferCache::MarkBufferUsed(Buffer& buffer) {

@@ -288,9 +288,23 @@ void Scheduler::BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBi
         .pSignalSemaphores = &semaphore,
     };
     vk::Result result;
+    const auto bind_start = std::chrono::steady_clock::now();
+    SubmitCriticalPhase contended_phase = SubmitCriticalPhase::None;
     {
         SubmitLock lk{SubmitCriticalPhase::SparseBind};
+        contended_phase = lk.ContendedPhase();
         result = instance.GetGraphicsQueue().bindSparse(bind_info, VK_NULL_HANDLE);
+    }
+    const auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - bind_start)
+                             .count();
+    ++sparse_bind_stats.count;
+    sparse_bind_stats.total_ms += static_cast<u64>(bind_ms);
+    sparse_bind_stats.max_ms = std::max<u64>(sparse_bind_stats.max_ms, bind_ms);
+    if (bind_ms >= 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "Slow sparse bind: {} ms for {} ranges, contended_phase={}, value={}", bind_ms,
+                    binds.size(), SubmitCriticalPhaseName(contended_phase), signal_value);
     }
     if (result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceLoss("sparse memory binding");

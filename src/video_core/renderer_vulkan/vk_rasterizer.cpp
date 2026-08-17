@@ -744,6 +744,25 @@ void Rasterizer::OnSubmit() {
         }
 
         gc_pressure = gc_budget.pressure;
+
+        // Cheap cumulative view of the buffer cache: replacement kinds and, for sparse buffers,
+        // demand binding volume and total bound bytes. Sampled so it stays a few lines per minute.
+        if (++cache_stats_log_count >= 30) {
+            cache_stats_log_count = 0;
+            const auto cache_stats = buffer_cache.GetStatistics();
+            const auto sparse_stats = scheduler.GetSparseBindStatistics();
+            LOG_INFO(Render_Vulkan,
+                     "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
+                     "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "
+                     "sparse_binds={} ({} ms total, max {} ms), usage={} MiB",
+                     cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB,
+                     cache_stats.replacements, cache_stats.replacements_new,
+                     cache_stats.replacements_grow, cache_stats.replacements_bridge,
+                     cache_stats.replaced_bytes / 1_MB, cache_stats.sparse,
+                     cache_stats.demand_bindings, cache_stats.demand_bound_bytes / 1_MB,
+                     sparse_stats.count, sparse_stats.total_ms, sparse_stats.max_ms,
+                     used_memory / 1_MB);
+        }
     }
 }
 
