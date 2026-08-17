@@ -115,6 +115,12 @@ constexpr u64 GcMinimumAutomaticEvictionBytes = 2_MB;
     return !emergency && allocation_size < GcMinimumAutomaticEvictionBytes;
 }
 
+// Skipping a small object is a size comparison; it must not consume the same budget as a real
+// inspection or thousands of tiny objects at the old end of the LRU stop the collector from ever
+// reaching the large ones behind them (Run 30: ~2,600 of ~2,640 inspections were small-skips and
+// no texture was evicted all session). The cheap-scan cap only bounds worst-case list walking.
+constexpr u32 GcMaxCheapScans = 16384;
+
 // Keep enough room for the allocation itself plus a small amount of driver bookkeeping. The
 // driver's heap budget can move between queries, so targeting its exact edge still races other
 // processes and allocations made internally by the driver.

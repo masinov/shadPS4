@@ -1006,15 +1006,24 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
     candidates.reserve(inspections_remaining);
     u64 candidate_bytes{};
 
+    u32 cheap_scans_remaining = GcMaxCheapScans;
     const auto collect = [&](ImageId image_id) {
-        if (inspections_remaining == 0 || (budget.pressure != GcPressure::Critical &&
-                                           candidate_bytes >= budget.bytes_remaining)) {
+        if (inspections_remaining == 0 || cheap_scans_remaining == 0 ||
+            (budget.pressure != GcPressure::Critical &&
+             candidate_bytes >= budget.bytes_remaining)) {
             return true;
+        }
+        --cheap_scans_remaining;
+
+        auto& image = slot_images[image_id];
+        // A size test is not an inspection; see the buffer collector.
+        if (image.info.pixel_format != vk::Format::eUndefined &&
+            ShouldSkipSmallEviction(image.AllocationSizeBytes(), budget.emergency)) {
+            ++result.skipped_small;
+            return false;
         }
         --inspections_remaining;
         ++result.inspected_objects;
-
-        auto& image = slot_images[image_id];
         // Stencil-only guest ranges are deliberately represented by registered Image entries with
         // an undefined format and no Vulkan backing. They participate in overlap resolution and
         // depth association, but cannot contribute bytes toward a device-memory reclaim target.
@@ -1030,10 +1039,6 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             return false;
         }
 
-        if (ShouldSkipSmallEviction(image.AllocationSizeBytes(), budget.emergency)) {
-            ++result.skipped_small;
-            return false;
-        }
         if (IsResourceInFlight(image.tick_accessed_last, scheduler.CurrentTick())) {
             ++result.skipped_in_flight;
             return false;

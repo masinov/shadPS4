@@ -1414,14 +1414,14 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
     candidates.reserve(inspections_remaining);
     u64 candidate_bytes{};
 
+    u32 cheap_scans_remaining = GcMaxCheapScans;
     const auto collect = [&](BufferId buffer_id) {
-        if (inspections_remaining == 0 || (budget.pressure != GcPressure::Critical &&
-                                           candidate_bytes >= budget.bytes_remaining)) {
+        if (inspections_remaining == 0 || cheap_scans_remaining == 0 ||
+            (budget.pressure != GcPressure::Critical &&
+             candidate_bytes >= budget.bytes_remaining)) {
             return true;
         }
-        --inspections_remaining;
-        ++result.inspected_objects;
-
+        --cheap_scans_remaining;
         if (IsBufferInvalid(buffer_id)) {
             return false;
         }
@@ -1432,11 +1432,15 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
         const u64 allocation_size = buffer.AllocationSizeBytes();
         ASSERT_MSG(allocation_size != 0 || buffer.IsSparse(),
                    "Tracked buffer has no physical allocation");
-
+        // A size test is not an inspection: consuming the inspection budget on it would let the
+        // tiny old tail of the LRU hide every large object behind it.
         if (ShouldSkipSmallEviction(allocation_size, budget.emergency)) {
             ++result.skipped_small;
             return false;
         }
+        --inspections_remaining;
+        ++result.inspected_objects;
+
         if (IsResourceInFlight(buffer.LastUseTick(), scheduler.CurrentTick())) {
             ++result.skipped_in_flight;
             return false;
