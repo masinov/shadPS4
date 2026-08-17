@@ -841,18 +841,24 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
         AllocationReclaimTarget(used_memory, total_budget, size, false) != 0;
     const bool sample_pressure =
         under_pressure && ShouldLogDiagnosticSample(++pressure_allocation_log_count);
-    if (size >= 64_MB || sample_pressure || chain_advanced) {
+    // Chain advances are frequent under sustained streaming; sample them like pressure events so
+    // a synchronous log cannot become the workload (Run 25: 24,841 lines in 11 minutes).
+    const bool sample_chain =
+        chain_advanced && ShouldLogDiagnosticSample(++chain_advance_log_count);
+    ++replacement_count;
+    if (size >= 64_MB || sample_pressure || sample_chain) {
         LOG_INFO(Render_Vulkan,
                  "Cache buffer allocation: request=[{:#x},{:#x}) ({} bytes), "
                  "resolved=[{:#x},{:#x}) ({} bytes), overlaps={} ({} bytes, largest {}), "
                  "stream_leap={}, usage={} MiB, budget={} MiB, pressure_sample={}, "
                  "stream_suppressed={}, desired_growth={} bytes, speculative={} bytes, "
-                 "chain_advanced={}, tick_deferred={} bytes",
+                 "chain_advanced={}, tick_deferred={} bytes, replacements={}",
                  requested_addr, requested_addr + requested_size, requested_size, overlap.begin,
                  overlap.end, size, overlap.ids.size(), overlap_bytes, largest_overlap,
                  overlap.has_stream_leap, used_memory / 1_MB, total_budget / 1_MB, sample_pressure,
                  overlap.stream_growth_suppressed, overlap.desired_stream_growth,
-                 overlap.speculative_bytes, chain_advanced, chain_deferred_before);
+                 overlap.speculative_bytes, chain_advanced, chain_deferred_before,
+                 replacement_count);
     }
 
     ReclaimForAllocation(size, false, allow_texture_gc);

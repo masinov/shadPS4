@@ -306,6 +306,8 @@ private:
     Common::SlotVector<Buffer> slot_buffers;
     u64 gc_tick = 0;
     u64 pressure_allocation_log_count{};
+    u64 chain_advance_log_count{};
+    u64 replacement_count{};
     u64 replacement_chain_tick{};
     u64 replacement_chain_deferred_bytes{};
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
