@@ -358,10 +358,25 @@ function Get-TesterConfig {
     }
     $port = $env:TESTER_SSH_PORT
     if ([string]::IsNullOrWhiteSpace($port)) { $port = '22' }
-    $dest = $env:TESTER_DEST_DIR_ROOT
-    if ([string]::IsNullOrWhiteSpace($dest)) { $dest = $RemoteDirectory.TrimEnd('/') }
-    $reportDir = $env:TESTER_REPORT_DIR
-    if ([string]::IsNullOrWhiteSpace($reportDir)) { $reportDir = $dest }
+    # Exchange layout: TESTER_DEST_DIR_ROOT is the base; TESTER_BUILDS_DIR (builds we send) and
+    # TESTER_REPORT_DIR (reports we fetch) are resolved under it unless given as absolute paths.
+    $root = $env:TESTER_DEST_DIR_ROOT
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = $RemoteDirectory.TrimEnd('/') }
+    $root = ($root -replace '\\', '/').TrimEnd('/')
+    $resolveUnderRoot = {
+        param([string]$value, [string]$fallback)
+        if ([string]::IsNullOrWhiteSpace($value)) { $value = $fallback }
+        $value = ($value -replace '\\', '/').TrimEnd('/')
+        if ($value -match '^[A-Za-z]:' -or $value.StartsWith('/') -or
+            [string]::IsNullOrWhiteSpace($root)) {
+            return $value
+        }
+        return "$root/$value"
+    }
+    $buildsDir = & $resolveUnderRoot $env:TESTER_BUILDS_DIR ''
+    if ([string]::IsNullOrWhiteSpace($env:TESTER_BUILDS_DIR)) { $buildsDir = $root }
+    $reportDir = & $resolveUnderRoot $env:TESTER_REPORT_DIR ''
+    if ([string]::IsNullOrWhiteSpace($env:TESTER_REPORT_DIR)) { $reportDir = $root }
     $reportGlob = $env:TESTER_REPORT_GLOB
     if ([string]::IsNullOrWhiteSpace($reportGlob)) { $reportGlob = 'shadlix-*report*.zip' }
     return [pscustomobject]@{
@@ -370,8 +385,8 @@ function Get-TesterConfig {
         Port = $port
         Key = $env:TESTER_SSH_KEY
         Password = $env:TESTER_SSH_PASSWORD
-        DestDir = $dest.TrimEnd('/')
-        ReportDir = $reportDir.TrimEnd('/')
+        DestDir = $buildsDir
+        ReportDir = $reportDir
         ReportGlob = $reportGlob
         Target = "$user@$sshHost"
     }
@@ -385,9 +400,21 @@ function Invoke-TesterSsh {
         [Parameter(Mandatory)][string[]]$Arguments,
         [Parameter(Mandatory)]$Config
     )
-    $exe = Join-Path $env:SystemRoot "System32/OpenSSH/$Tool.exe"
-    if (-not (Test-Path -LiteralPath $exe)) {
-        $exe = "$Tool.exe"
+    $usePassword = [string]::IsNullOrWhiteSpace($Config.Key) -and
+        -not [string]::IsNullOrWhiteSpace($Config.Password)
+    if ($usePassword) {
+        # Windows' native OpenSSH cannot execute a script as SSH_ASKPASS (CreateProcess needs an
+        # executable) and silently falls back to an interactive prompt. Git's bundled OpenSSH runs
+        # askpass through sh, so a shell-script askpass works non-interactively there.
+        $exe = 'C:/Program Files/Git/usr/bin/{0}.exe' -f $Tool
+        if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Password authentication needs Git for Windows ($exe not found); install it or set TESTER_SSH_KEY."
+        }
+    } else {
+        $exe = Join-Path $env:SystemRoot "System32/OpenSSH/$Tool.exe"
+        if (-not (Test-Path -LiteralPath $exe)) {
+            $exe = "$Tool.exe"
+        }
     }
     $common = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15')
     if (-not [string]::IsNullOrWhiteSpace($Config.Key)) {
@@ -396,24 +423,43 @@ function Invoke-TesterSsh {
     $askpass = $null
     $oldEnv = @{}
     try {
-        if ([string]::IsNullOrWhiteSpace($Config.Key) -and
-            -not [string]::IsNullOrWhiteSpace($Config.Password)) {
-            $askpass = Join-Path ([IO.Path]::GetTempPath()) ("shadlix-askpass-{0}.cmd" -f [Guid]::NewGuid().ToString('N'))
-            # %TESTER_SSH_PASSWORD% is expanded by the child cmd from its environment, so the
-            # password is never written to disk.
-            Set-Content -LiteralPath $askpass -Value '@echo %TESTER_SSH_PASSWORD%' -Encoding ascii
+        if ($usePassword) {
+            $askpass = Join-Path ([IO.Path]::GetTempPath()) ("shadlix-askpass-{0}.sh" -f [Guid]::NewGuid().ToString('N'))
+            # The password is read from the child's environment, never written to disk.
+            [IO.File]::WriteAllText($askpass, "#!/bin/sh`nprintf '%s' `"`$TESTER_SSH_PASSWORD`"`n")
             foreach ($name in 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY', 'TESTER_SSH_PASSWORD') {
                 $oldEnv[$name] = [Environment]::GetEnvironmentVariable($name)
             }
-            $env:SSH_ASKPASS = $askpass
+            $env:SSH_ASKPASS = ($askpass -replace '\\', '/')
             $env:SSH_ASKPASS_REQUIRE = 'force'
             $env:DISPLAY = ':0'
             $env:TESTER_SSH_PASSWORD = $Config.Password
         }
-        $output = & $exe @common @Arguments 2>&1
-        $code = $LASTEXITCODE
+        # Keep stderr out of the captured stream: ssh writes banners/warnings there, and callers
+        # parse stdout (e.g. a remote file path). PS 5.1 also wraps redirected native stderr in
+        # ErrorRecords, which is pure noise here.
+        $stderrFile = Join-Path ([IO.Path]::GetTempPath()) ("shadlix-ssh-{0}.err" -f [Guid]::NewGuid().ToString('N'))
+        try {
+            # Under Set-StrictMode + ErrorActionPreference=Stop, PowerShell 5.1 turns any native
+            # stderr line into a terminating error even when redirected; relax it for the call and
+            # judge success by the exit code alone.
+            $previousEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = & $exe @common @Arguments 2>$stderrFile
+            } finally {
+                $ErrorActionPreference = $previousEap
+            }
+            $code = $LASTEXITCODE
+        } finally {
+            $stderrText = ''
+            if (Test-Path -LiteralPath $stderrFile) {
+                $stderrText = (Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue)
+                Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+            }
+        }
         if ($code -ne 0) {
-            throw "$Tool failed with exit code ${code}: $($output | Select-Object -Last 3 | Out-String)"
+            throw "$Tool failed with exit code ${code}: $stderrText"
         }
         return $output
     } finally {
@@ -424,6 +470,13 @@ function Invoke-TesterSsh {
             Remove-Item -LiteralPath $askpass -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# Encodes a PowerShell command for remote execution via `powershell -EncodedCommand`, which
+# survives any combination of ssh/cmd quoting on theremote side.
+function Get-RemotePwshCommand([string]$Command) {
+    $bytes = [Text.Encoding]::Unicode.GetBytes($Command)
+    return 'powershell -NoProfile -EncodedCommand {0}' -f [Convert]::ToBase64String($bytes)
 }
 
 function Get-PortArgs([string]$Tool, $Config) {
@@ -447,7 +500,7 @@ function Setup-SshKey {
     $publicKey = (Get-Content -LiteralPath "$keyPath.pub" -Raw).Trim()
     # Works for both OpenSSH-on-Windows (administrators_authorized_keys not needed for normal
     # users) and Linux sshd. Appends only if absent.
-    $remoteCmd = "powershell -NoProfile -Command `"`$k='$publicKey'; `$f=Join-Path `$env:USERPROFILE '.ssh/authorized_keys'; New-Item -ItemType Directory -Force (Split-Path `$f) | Out-Null; if (-not (Test-Path `$f) -or -not (Select-String -LiteralPath `$f -SimpleMatch `$k -Quiet)) { Add-Content -LiteralPath `$f -Value `$k }`""
+    $remoteCmd = Get-RemotePwshCommand ("`$k='{0}'; `$f=Join-Path `$env:USERPROFILE '.ssh/authorized_keys'; New-Item -ItemType Directory -Force (Split-Path `$f) | Out-Null; if (-not (Test-Path `$f) -or -not (Select-String -LiteralPath `$f -SimpleMatch `$k -Quiet)) {{ Add-Content -LiteralPath `$f -Value `$k }}" -f $publicKey)
     Invoke-TesterSsh -Tool ssh -Config $config -Arguments ((Get-PortArgs 'ssh' $config) + @($config.Target, $remoteCmd)) | Out-Null
     Write-CompactResult ([pscustomobject]@{
         Action = 'SetupSshKey'
@@ -459,7 +512,7 @@ function Setup-SshKey {
 function Fetch-Report {
     $config = Get-TesterConfig
     # Newest matching report on the tester side, by write time.
-    $listCmd = "powershell -NoProfile -Command `"Get-ChildItem -Path '$($config.ReportDir)/$($config.ReportGlob)' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName`""
+    $listCmd = Get-RemotePwshCommand ("Get-ChildItem -Path '{0}/{1}' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName" -f $config.ReportDir, $config.ReportGlob)
     $remotePath = (Invoke-TesterSsh -Tool ssh -Config $config -Arguments ((Get-PortArgs 'ssh' $config) + @($config.Target, $listCmd)) |
         Where-Object { $_ -is [string] -or $_ -isnot [System.Management.Automation.ErrorRecord] } |
         Out-String).Trim()
@@ -468,7 +521,7 @@ function Fetch-Report {
     }
     $localDir = Join-Path $env:USERPROFILE 'Downloads'
     $localPath = Join-Path $localDir (Split-Path -Leaf $remotePath)
-    $scpSource = '{0}:"{1}"' -f $config.Target, ($remotePath -replace '\', '/')
+    $scpSource = '{0}:"{1}"' -f $config.Target, ($remotePath -replace '\\', '/')
     Invoke-TesterSsh -Tool scp -Config $config -Arguments ((Get-PortArgs 'scp' $config) + @($scpSource, $localPath)) | Out-Null
     if (-not (Test-Path -LiteralPath $localPath)) {
         throw "scp reported success but $localPath does not exist."
