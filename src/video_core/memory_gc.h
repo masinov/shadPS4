@@ -25,6 +25,8 @@ struct GcBudget {
     GcPressure pressure{GcPressure::None};
     bool collect_retirements{};
     bool require_completed{};
+    /// A real allocation failure: every reclaimable byte matters, even tiny objects.
+    bool emergency{};
 
     [[nodiscard]] bool Active() const noexcept {
         return pressure != GcPressure::None && bytes_remaining != 0 && objects_remaining != 0;
@@ -46,6 +48,7 @@ struct GcResult {
     u32 skipped_in_flight{};
     u32 skipped_pending{};
     u32 skipped_unallocated{};
+    u32 skipped_small{};
     std::vector<Common::UniqueFunction<void>> retirements;
 
     void QueueRetirement(u64 use_tick, Common::UniqueFunction<void>&& retirement) {
@@ -99,6 +102,17 @@ struct GcResult {
 // a material part of the workload.
 [[nodiscard]] constexpr bool ShouldLogDiagnosticSample(u64 event_count) noexcept {
     return event_count != 0 && (event_count <= 8 || (event_count & (event_count - 1)) == 0);
+}
+
+// Evicting an object far smaller than the reclaim target is pure churn: it frees almost nothing
+// and its recreation costs an allocation (and, for sparse buffers, a queue bind) within seconds.
+// Run 28: periodic GC at critical pressure chased a ~500 MiB target by evicting ~24 tiny sparse
+// buffers (2-3 MiB total) per pass, which the game recreated immediately (~30 binds/s sustained).
+// Automatic collection skips such objects; only an actual allocation failure may take them.
+constexpr u64 GcMinimumAutomaticEvictionBytes = 2_MB;
+
+[[nodiscard]] constexpr bool ShouldSkipSmallEviction(u64 allocation_size, bool emergency) noexcept {
+    return !emergency && allocation_size < GcMinimumAutomaticEvictionBytes;
 }
 
 // Keep enough room for the allocation itself plus a small amount of driver bookkeeping. The

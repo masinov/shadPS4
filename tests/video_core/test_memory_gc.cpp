@@ -96,3 +96,15 @@ TEST(MemoryGc, EvictionAgeIsMeasuredInSubmissions) {
     EXPECT_GT(VideoCore::GcMinimumAge(VideoCore::GcPressure::High),
               VideoCore::GcMinimumAge(VideoCore::GcPressure::Critical));
 }
+
+TEST(MemoryGc, AutomaticCollectionSkipsTinyObjects) {
+    // Run 28: periodic GC chased a ~500 MiB target by evicting tiny sparse buffers the game
+    // recreated immediately (~30 binds/s). Only an emergency pass may take objects this small.
+    EXPECT_TRUE(VideoCore::ShouldSkipSmallEviction(128_KB, false));
+    EXPECT_TRUE(
+        VideoCore::ShouldSkipSmallEviction(VideoCore::GcMinimumAutomaticEvictionBytes - 1, false));
+    EXPECT_FALSE(
+        VideoCore::ShouldSkipSmallEviction(VideoCore::GcMinimumAutomaticEvictionBytes, false));
+    EXPECT_FALSE(VideoCore::ShouldSkipSmallEviction(128_KB, true));
+    EXPECT_FALSE(VideoCore::ShouldSkipSmallEviction(64_MB, false));
+}

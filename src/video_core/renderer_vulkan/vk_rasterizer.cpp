@@ -530,6 +530,7 @@ void Rasterizer::ReclaimForAllocation(u64 reclaim_target, u64 allocation_size, b
         .pressure = VideoCore::GcPressure::Critical,
         .collect_retirements = true,
         .require_completed = !forced,
+        .emergency = forced,
     };
     const u64 used_before = instance.GetDeviceMemoryUsage();
 
@@ -726,9 +727,11 @@ void Rasterizer::OnSubmit() {
             LOG_WARNING(Render_Vulkan,
                         "VRAM GC pass took {} ms: inspected={}, evicted={} ({} MiB estimated), "
                         "skipped_gpu_modified={}, skipped_in_flight={}, skipped_unallocated={}, "
-                        "remaining_target={} MiB",
+                        "skipped_small={}, remaining_target={} MiB",
                         gc_elapsed, inspected, evicted, reclaimed / 1_MB, skipped_modified,
-                        skipped_in_flight, skipped_unallocated, gc_budget.bytes_remaining / 1_MB);
+                        skipped_in_flight, skipped_unallocated,
+                        texture_result.skipped_small + buffer_result.skipped_small,
+                        gc_budget.bytes_remaining / 1_MB);
         } else if (gc_budget.pressure != VideoCore::GcPressure::None &&
                    (pressure_changed || ++gc_log_count >= 30)) {
             gc_log_count = 0;

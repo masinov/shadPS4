@@ -1030,6 +1030,10 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             return false;
         }
 
+        if (ShouldSkipSmallEviction(image.AllocationSizeBytes(), budget.emergency)) {
+            ++result.skipped_small;
+            return false;
+        }
         if (IsResourceInFlight(image.tick_accessed_last, scheduler.CurrentTick())) {
             ++result.skipped_in_flight;
             return false;

@@ -1424,6 +1424,10 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
         ASSERT_MSG(allocation_size != 0 || buffer.IsSparse(),
                    "Tracked buffer has no physical allocation");
 
+        if (ShouldSkipSmallEviction(allocation_size, budget.emergency)) {
+            ++result.skipped_small;
+            return false;
+        }
         if (IsResourceInFlight(buffer.LastUseTick(), scheduler.CurrentTick())) {
             ++result.skipped_in_flight;
             return false;
