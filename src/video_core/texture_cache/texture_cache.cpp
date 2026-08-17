@@ -221,6 +221,7 @@ void TextureCache::ApplyReadyReadbacks() {
         if (image.tick_accessed_last != readback.record_access_tick) {
             // Used (and possibly re-written) after the download was recorded; the staged copy may
             // be stale. Abandon; the collector can nominate it again later.
+            ++readback_stats.aborted_reused;
             continue;
         }
         // GPU ticks say nothing about CPU writes: if the guest streamed new data into this range
@@ -228,6 +229,16 @@ void TextureCache::ApplyReadyReadbacks() {
         // exact hazard behind Run 35's exploding geometry and untraceable crash. Dirty flags are
         // set whenever the range was CPU-written (write watcher or untrack), so any dirt aborts.
         if (True(image.flags & ImageFlagBits::Dirty)) {
+            ++readback_stats.aborted_dirty;
+            continue;
+        }
+        // The guest range may also back GPU-written *buffers* (Bloodborne aliases vertex/effect
+        // buffers over image memory). Writing this image's tiled bytes over such a range and
+        // flushing the tracker makes the next buffer sync upload tiled texels into the vertex
+        // buffer: garbage positions under perfectly valid materials — Run 36's animated-ribbon
+        // explosion. Any buffer-side GPU-authored data in the range aborts the writeback.
+        if (buffer_cache.IsRegionGpuModified(readback.guest_address, readback.guest_size)) {
+            ++readback_stats.aborted_buffer_alias;
             continue;
         }
         // Likewise, another image aliasing this guest range may carry newer GPU-authored content;
@@ -241,8 +252,10 @@ void TextureCache::ApplyReadyReadbacks() {
                                  }
                              });
         if (aliased_newer) {
+            ++readback_stats.aborted_image_alias;
             continue;
         }
+        ++readback_stats.applied;
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(readback.guest_address),
                                                   readback.data.data(), readback.data.size());
         image.flags &= ~ImageFlagBits::GpuModified;
@@ -1192,9 +1205,12 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             if (False(image.flags & ImageFlagBits::EvictionReadback) &&
                 False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&
-                image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4) {
+                image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4 &&
+                !buffer_cache.IsRegionGpuModified(image.info.guest_address,
+                                                  image.info.guest_size)) {
                 image.flags |= ImageFlagBits::EvictionReadback;
                 eviction_readbacks.push_back(image_id);
+                ++readback_stats.nominated;
             }
             ++result.skipped_gpu_modified;
             return false;

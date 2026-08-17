@@ -782,6 +782,13 @@ void Rasterizer::OnSubmit() {
             cache_stats_log_count = 0;
             const auto cache_stats = buffer_cache.GetStatistics();
             const auto sparse_stats = scheduler.GetSparseBindStatistics();
+            const auto readback_stats = texture_cache.GetReadbackStats();
+            LOG_INFO(Render_Vulkan,
+                     "Eviction readback: nominated={}, applied={}, aborted_dirty={}, "
+                     "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}",
+                     readback_stats.nominated, readback_stats.applied, readback_stats.aborted_dirty,
+                     readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
+                     readback_stats.aborted_image_alias);
             LOG_INFO(Render_Vulkan,
                      "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
                      "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "

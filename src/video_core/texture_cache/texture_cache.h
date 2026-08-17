@@ -363,6 +363,23 @@ private:
     std::unordered_set<ImageId> download_images;
     u64 gc_tick = 0;
     std::vector<ImageId> eviction_readbacks;
+
+public:
+    struct ReadbackStats {
+        u64 nominated{};
+        u64 applied{};
+        u64 aborted_dirty{};
+        u64 aborted_reused{};
+        u64 aborted_buffer_alias{};
+        u64 aborted_image_alias{};
+    };
+
+    [[nodiscard]] ReadbackStats GetReadbackStats() const noexcept {
+        return readback_stats;
+    }
+
+private:
+    ReadbackStats readback_stats{};
     /// Image ids with a recorded-but-unwritten eviction readback. DeleteImage removes an id here
     /// so a completed readback of a deleted image is discarded instead of touching a reused slot.
     std::unordered_set<u32> eviction_readback_inflight;
