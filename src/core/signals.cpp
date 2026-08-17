@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
@@ -11,6 +13,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+// dbghelp.h requires the windows.h types above and must not be reordered before it.
+// clang-format off
+#include <dbghelp.h>
+// clang-format on
 #else
 #include <csignal>
 #include <pthread.h>
@@ -143,10 +149,44 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 
 #endif
 
+#if defined(_WIN32)
+// Last-resort crash recorder. Run 35 terminated with no device loss, no assertion, no WER report
+// and a log truncated mid-write: an entire class of failure was invisible. This filter runs only
+// when no VEH/guest handler claimed the exception, writes one minidump beside the log directory,
+// and lets the process die normally afterwards.
+static LONG WINAPI UnhandledCrashFilter(EXCEPTION_POINTERS* pointers) {
+    static std::atomic_flag dumped = ATOMIC_FLAG_INIT;
+    if (dumped.test_and_set()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto dump_path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "crash.dmp";
+    const HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION info{
+            .ThreadId = GetCurrentThreadId(),
+            .ExceptionPointers = pointers,
+            .ClientPointers = FALSE,
+        };
+        MiniDumpWriteDump(
+            GetCurrentProcess(), GetCurrentProcessId(), file,
+            static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory),
+            &info, nullptr, nullptr);
+        CloseHandle(file);
+    }
+    LOG_CRITICAL(Core, "Unhandled exception {:#x} at {}; minidump written to {}",
+                 pointers->ExceptionRecord->ExceptionCode,
+                 fmt::ptr(pointers->ExceptionRecord->ExceptionAddress),
+                 fmt::UTF(dump_path.u8string()));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 SignalDispatch::SignalDispatch() {
 #if defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
+    SetUnhandledExceptionFilter(UnhandledCrashFilter);
 #else
     struct sigaction action{};
     action.sa_sigaction = SignalHandler;

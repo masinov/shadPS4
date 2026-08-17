@@ -223,6 +223,26 @@ void TextureCache::ApplyReadyReadbacks() {
             // be stale. Abandon; the collector can nominate it again later.
             continue;
         }
+        // GPU ticks say nothing about CPU writes: if the guest streamed new data into this range
+        // after the download was recorded, writing the stale GPU copy back would corrupt it — the
+        // exact hazard behind Run 35's exploding geometry and untraceable crash. Dirty flags are
+        // set whenever the range was CPU-written (write watcher or untrack), so any dirt aborts.
+        if (True(image.flags & ImageFlagBits::Dirty)) {
+            continue;
+        }
+        // Likewise, another image aliasing this guest range may carry newer GPU-authored content;
+        // flushing the tracker under it would let a later sync upload these stale bytes over it.
+        bool aliased_newer = false;
+        ForEachImageInRegion(readback.guest_address, readback.guest_size,
+                             [&](ImageId other_id, Image& other) {
+                                 if (other_id != readback.image_id &&
+                                     True(other.flags & ImageFlagBits::GpuModified)) {
+                                     aliased_newer = true;
+                                 }
+                             });
+        if (aliased_newer) {
+            continue;
+        }
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(readback.guest_address),
                                                   readback.data.data(), readback.data.size());
         image.flags &= ~ImageFlagBits::GpuModified;
@@ -1170,6 +1190,7 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             // memory asynchronously; once that completes the image is CPU-authoritative and a
             // later pass can evict it. Nominate a bounded number of large candidates per pass.
             if (False(image.flags & ImageFlagBits::EvictionReadback) &&
+                False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&
                 image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4) {
                 image.flags |= ImageFlagBits::EvictionReadback;
