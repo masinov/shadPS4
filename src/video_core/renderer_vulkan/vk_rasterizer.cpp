@@ -554,6 +554,7 @@ void Rasterizer::ReclaimForAllocation(u64 reclaim_target, u64 allocation_size, b
         .collect_retirements = true,
         .require_completed = !forced,
         .emergency = forced,
+        .overshoot = forced || instance.GetDeviceMemoryUsage() > instance.GetTotalMemoryBudget(),
     };
     const u64 used_before = instance.GetDeviceMemoryUsage();
 
@@ -720,6 +721,7 @@ void Rasterizer::OnSubmit() {
             const u64 hysteresis = std::min<u64>(trigger_memory / 8, 256_MB);
             const u64 target_memory = trigger_memory > hysteresis ? trigger_memory - hysteresis : 0;
             gc_budget.bytes_remaining = used_memory - target_memory;
+            gc_budget.overshoot = used_memory > total_budget;
         }
 
         const bool pressure_changed = gc_budget.pressure != gc_pressure;

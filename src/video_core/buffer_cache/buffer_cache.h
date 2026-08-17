@@ -334,6 +334,7 @@ private:
     bool sparse_buffers{};
     u64 pressure_allocation_log_count{};
     u64 chain_advance_log_count{};
+    u64 grow_log_count{};
     u64 replacement_count{};
     Statistics stats{};
     u64 replacement_chain_tick{};

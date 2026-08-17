@@ -27,6 +27,8 @@ struct GcBudget {
     bool require_completed{};
     /// A real allocation failure: every reclaimable byte matters, even tiny objects.
     bool emergency{};
+    /// Usage exceeds the budget itself (not merely the headroom): evict warmer objects.
+    bool overshoot{};
 
     [[nodiscard]] bool Active() const noexcept {
         return pressure != GcPressure::None && bytes_remaining != 0 && objects_remaining != 0;
@@ -72,10 +74,15 @@ struct GcResult {
 // preflight can run the collector many times inside one frame, and an epoch that advances per
 // call makes a resource used every frame look "old" between two draws of the same frame. That
 // evicts hot streaming buffers which are then rebuilt piecewise and re-merged with full copies.
-[[nodiscard]] constexpr u64 GcMinimumAge(GcPressure pressure) noexcept {
+[[nodiscard]] constexpr u64 GcMinimumAge(GcPressure pressure, bool overshoot = false) noexcept {
     // Epochs advance once per guest submission (tens per second). The previous 8/32 made assets
     // idle for a fraction of a second evictable; Run 31 showed that as visible eviction/re-upload
     // bursts once the collector could actually reach large objects. Roughly two / eight seconds.
+    // Once usage actually exceeds the budget the calculus changes: leaving 1.7 GiB of targets
+    // unmet (Run 32 tail) risks driver residency stalls and TDR, so accept warmer evictions.
+    if (overshoot) {
+        return 16;
+    }
     return pressure == GcPressure::Critical ? 64 : 256;
 }
 

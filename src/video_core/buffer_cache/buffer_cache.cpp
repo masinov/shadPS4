@@ -875,6 +875,9 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     // a synchronous log cannot become the workload (Run 25: 24,841 lines in 11 minutes).
     const bool sample_chain =
         chain_advanced && ShouldLogDiagnosticSample(++chain_advance_log_count);
+    // Grow replacements dominate sustained streaming; sample them individually so the operation
+    // that rewrites buffer backing most often is observable without flooding a synchronous log.
+    const bool sample_grow = overlap.ids.size() == 1 && ShouldLogDiagnosticSample(++grow_log_count);
     ++replacement_count;
     ++stats.replacements;
     if (overlap.ids.empty()) {
@@ -887,7 +890,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     stats.replaced_bytes += overlap_bytes;
     // Sparse buffers bind only the requested pages now; the rest of the range is address space.
     const u64 allocation_bytes = sparse_buffers ? wanted_size : size;
-    if (allocation_bytes >= 64_MB || sample_pressure || sample_chain) {
+    if (allocation_bytes >= 64_MB || sample_pressure || sample_chain || sample_grow) {
         LOG_INFO(Render_Vulkan,
                  "Cache buffer allocation: request=[{:#x},{:#x}) ({} bytes), "
                  "resolved=[{:#x},{:#x}) ({} bytes), overlaps={} ({} bytes, largest {}), "
@@ -1394,7 +1397,7 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
     // Under critical pressure consider older resources sooner, but never resources touched in the
     // current epochs. GPU-authored buffers are skipped: reading each one back synchronously here
     // can serialize dozens of scheduler.Finish() calls on the command processor.
-    const u64 min_age = GcMinimumAge(budget.pressure);
+    const u64 min_age = GcMinimumAge(budget.pressure, budget.overshoot);
     if (gc_tick <= min_age) {
         return result;
     }

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <string_view>
+#include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -170,12 +171,26 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
-    if (sparse_bind_pending) {
-        // Sparse binding operations complete asynchronously with respect to later submissions;
-        // the command buffer recorded since the last bind must not start before they finish.
-        info.AddWait(*sparse_bind_semaphore, sparse_bind_value,
+    const bool has_sparse_binds = !pending_sparse_binds.empty();
+    if (has_sparse_binds) {
+        if (!sparse_bind_semaphore) {
+            const vk::StructureChain semaphore_chain = {
+                vk::SemaphoreCreateInfo{},
+                vk::SemaphoreTypeCreateInfo{
+                    .semaphoreType = vk::SemaphoreType::eTimeline,
+                    .initialValue = 0,
+                },
+            };
+            auto [sem_result, semaphore] =
+                instance.GetDevice().createSemaphoreUnique(semaphore_chain.get());
+            ASSERT_MSG(sem_result == vk::Result::eSuccess,
+                       "Failed to create sparse bind semaphore: {}", vk::to_string(sem_result));
+            sparse_bind_semaphore = std::move(semaphore);
+        }
+        // Sparse binding operations complete asynchronously with respect to command execution;
+        // this submission must not start before the binds it depends on finish.
+        info.AddWait(*sparse_bind_semaphore, sparse_bind_value + 1,
                      vk::PipelineStageFlagBits::eAllCommands);
-        sparse_bind_pending = false;
     }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
@@ -213,6 +228,52 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         lock_end = std::chrono::steady_clock::now();
         ImGui::Core::TextureManager::Submit();
         imgui_end = std::chrono::steady_clock::now();
+        if (has_sparse_binds) {
+            SetSubmitCriticalPhase(SubmitCriticalPhase::SparseBind);
+            const u64 bind_signal_value = ++sparse_bind_value;
+            boost::container::small_vector<vk::SparseBufferMemoryBindInfo, 8> buffer_binds;
+            size_t total_ranges = 0;
+            for (const PendingSparseBind& pending : pending_sparse_binds) {
+                buffer_binds.push_back(vk::SparseBufferMemoryBindInfo{
+                    .buffer = pending.buffer,
+                    .bindCount = static_cast<u32>(pending.binds.size()),
+                    .pBinds = pending.binds.data(),
+                });
+                total_ranges += pending.binds.size();
+            }
+            const vk::Semaphore bind_semaphore = *sparse_bind_semaphore;
+            const vk::TimelineSemaphoreSubmitInfo bind_timeline_info = {
+                .signalSemaphoreValueCount = 1,
+                .pSignalSemaphoreValues = &bind_signal_value,
+            };
+            const vk::BindSparseInfo bind_info = {
+                .pNext = &bind_timeline_info,
+                .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+                .pBufferBinds = buffer_binds.data(),
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = &bind_semaphore,
+            };
+            const auto bind_start = std::chrono::steady_clock::now();
+            const vk::Result bind_result =
+                instance.GetGraphicsQueue().bindSparse(bind_info, VK_NULL_HANDLE);
+            const auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - bind_start)
+                                     .count();
+            ++sparse_bind_stats.count;
+            sparse_bind_stats.total_ms += static_cast<u64>(bind_ms);
+            sparse_bind_stats.max_ms = std::max<u64>(sparse_bind_stats.max_ms, bind_ms);
+            if (bind_ms >= 20) {
+                LOG_WARNING(Render_Vulkan,
+                            "Slow sparse bind: {} ms for {} ranges in {} buffers, value={}",
+                            bind_ms, total_ranges, buffer_binds.size(), bind_signal_value);
+            }
+            if (bind_result == vk::Result::eErrorDeviceLost) {
+                instance.ReportDeviceLoss("sparse memory binding");
+            }
+            ASSERT_MSG(bind_result == vk::Result::eSuccess,
+                       "Failed to bind sparse buffer memory: {}", vk::to_string(bind_result));
+            pending_sparse_binds.clear();
+        }
         SetSubmitCriticalPhase(SubmitCriticalPhase::QueueSubmit);
         submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
         queue_end = std::chrono::steady_clock::now();
@@ -255,63 +316,8 @@ void Scheduler::BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBi
     if (binds.empty()) {
         return;
     }
-    if (!sparse_bind_semaphore) {
-        const vk::StructureChain semaphore_chain = {
-            vk::SemaphoreCreateInfo{},
-            vk::SemaphoreTypeCreateInfo{
-                .semaphoreType = vk::SemaphoreType::eTimeline,
-                .initialValue = 0,
-            },
-        };
-        auto [result, semaphore] =
-            instance.GetDevice().createSemaphoreUnique(semaphore_chain.get());
-        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create sparse bind semaphore: {}",
-                   vk::to_string(result));
-        sparse_bind_semaphore = std::move(semaphore);
-    }
-    const u64 signal_value = ++sparse_bind_value;
-    const vk::SparseBufferMemoryBindInfo buffer_bind = {
-        .buffer = buffer,
-        .bindCount = static_cast<u32>(binds.size()),
-        .pBinds = binds.data(),
-    };
-    const vk::Semaphore semaphore = *sparse_bind_semaphore;
-    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
-        .signalSemaphoreValueCount = 1,
-        .pSignalSemaphoreValues = &signal_value,
-    };
-    const vk::BindSparseInfo bind_info = {
-        .pNext = &timeline_info,
-        .bufferBindCount = 1,
-        .pBufferBinds = &buffer_bind,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &semaphore,
-    };
-    vk::Result result;
-    const auto bind_start = std::chrono::steady_clock::now();
-    SubmitCriticalPhase contended_phase = SubmitCriticalPhase::None;
-    {
-        SubmitLock lk{SubmitCriticalPhase::SparseBind};
-        contended_phase = lk.ContendedPhase();
-        result = instance.GetGraphicsQueue().bindSparse(bind_info, VK_NULL_HANDLE);
-    }
-    const auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - bind_start)
-                             .count();
-    ++sparse_bind_stats.count;
-    sparse_bind_stats.total_ms += static_cast<u64>(bind_ms);
-    sparse_bind_stats.max_ms = std::max<u64>(sparse_bind_stats.max_ms, bind_ms);
-    if (bind_ms >= 20) {
-        LOG_WARNING(Render_Vulkan,
-                    "Slow sparse bind: {} ms for {} ranges, contended_phase={}, value={}", bind_ms,
-                    binds.size(), SubmitCriticalPhaseName(contended_phase), signal_value);
-    }
-    if (result == vk::Result::eErrorDeviceLost) {
-        instance.ReportDeviceLoss("sparse memory binding");
-    }
-    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to bind sparse buffer memory: {}",
-               vk::to_string(result));
-    sparse_bind_pending = true;
+    pending_sparse_binds.push_back(
+        PendingSparseBind{buffer, std::vector<vk::SparseMemoryBind>{binds.begin(), binds.end()}});
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

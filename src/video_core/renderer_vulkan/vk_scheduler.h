@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <vector>
 #include <queue>
 
 #include "common/unique_function.h"
@@ -460,8 +461,9 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
-    /// Queues sparse memory binds on the graphics queue. The next submission of this scheduler
-    /// waits for them, so bound memory is visible to every command recorded from now on.
+    /// Records sparse memory binds to be submitted with this scheduler's next flush. The
+    /// submission waits for them, so bound memory is visible to every command recorded from now
+    /// on; batching them into the flush avoids a separate queue-mutex acquisition per bind.
     void BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds);
 
     struct SparseBindStatistics {
@@ -543,7 +545,11 @@ private:
     tracy::VkCtxScope* profiler_scope{};
     vk::UniqueSemaphore sparse_bind_semaphore;
     u64 sparse_bind_value{};
-    bool sparse_bind_pending{};
+    struct PendingSparseBind {
+        vk::Buffer buffer;
+        std::vector<vk::SparseMemoryBind> binds;
+    };
+    std::vector<PendingSparseBind> pending_sparse_binds;
     SparseBindStatistics sparse_bind_stats{};
 };
 

@@ -985,7 +985,7 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
         return result;
     }
 
-    const u64 min_age = GcMinimumAge(budget.pressure);
+    const u64 min_age = GcMinimumAge(budget.pressure, budget.overshoot);
     if (gc_tick <= min_age) {
         return result;
     }

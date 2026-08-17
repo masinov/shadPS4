@@ -719,7 +719,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DispatchIndirect", cmd_address));
-                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size, true);
+                        // on_gpu describes the argument memory, not the marker setting: this path
+                        // reads game-managed guest memory the CPU can snapshot at record time.
+                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size, false);
                         rasterizer->ScopeMarkerEnd();
                     } else {
                         rasterizer->DispatchIndirect(indirect_args_addr, offset, size, false);
@@ -1274,7 +1276,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
-                    rasterizer->DispatchIndirect(ib_address, 0, size, true);
+                    rasterizer->DispatchIndirect(ib_address, 0, size, false);
                     rasterizer->ScopeMarkerEnd();
                 } else {
                     rasterizer->DispatchIndirect(ib_address, 0, size, false);
