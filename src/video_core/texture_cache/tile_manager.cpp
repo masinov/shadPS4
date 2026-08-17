@@ -237,6 +237,14 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::Detile,
+                              Vulkan::GpuCheckpointContext{
+                                  .source_guest_address = info.guest_address,
+                                  .transfer_size = info.guest_size,
+                                  .group_x = dim_x,
+                                  .group_y = 1,
+                                  .group_z = 1,
+                              });
     cmdbuf.dispatch(dim_x, 1, 1);
     return {out_buffer, 0};
 }
@@ -317,6 +325,14 @@ TileManager::Result TileManager::TileLinearBuffer(vk::Buffer in_buffer, u32 in_o
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::TileLinear,
+                              Vulkan::GpuCheckpointContext{
+                                  .source_guest_address = info.guest_address,
+                                  .transfer_size = info.guest_size,
+                                  .group_x = dim_x,
+                                  .group_y = 1,
+                                  .group_z = 1,
+                              });
     cmdbuf.dispatch(dim_x, 1, 1);
     return {out_buffer, 0};
 }
@@ -402,6 +418,14 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::TileImageDispatch,
+                              Vulkan::GpuCheckpointContext{
+                                  .source_guest_address = info.guest_address,
+                                  .transfer_size = info.guest_size,
+                                  .group_x = dim_x,
+                                  .group_y = 1,
+                                  .group_z = 1,
+                              });
     cmdbuf.dispatch(dim_x, 1, 1);
 }
 

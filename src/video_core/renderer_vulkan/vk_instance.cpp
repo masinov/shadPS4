@@ -38,6 +38,12 @@ constexpr std::string_view CheckpointName(GpuCheckpoint checkpoint) {
         return "indirect-dispatch";
     case GpuCheckpoint::PredicationReduce:
         return "predication-reduce";
+    case GpuCheckpoint::Detile:
+        return "detile";
+    case GpuCheckpoint::TileLinear:
+        return "tile-linear";
+    case GpuCheckpoint::TileImageDispatch:
+        return "tile-image";
     case GpuCheckpoint::BufferUpload:
         return "buffer-upload";
     case GpuCheckpoint::BufferDownload:
@@ -251,6 +257,12 @@ void Instance::ReportDeviceLoss(std::string_view operation) const {
                 context.indirect_arguments ? "max_draw_commands" : "items";
             const std::string_view transfer_label =
                 context.indirect_arguments ? "arguments" : "transfer";
+            const std::string count_buffer = !context.indirect_arguments ? std::string{}
+                                             : context.destination_guest_address == 0
+                                                 ? std::string{", count_buffer=none"}
+                                                 : fmt::format(", count_buffer={:#x} generation {}",
+                                                               context.destination_guest_address,
+                                                               context.destination_generation);
             const std::string_view groups_label =
                 context.record_time_groups ? "record_time_groups" : "groups";
             LOG_CRITICAL(Render_Vulkan,
@@ -258,8 +270,8 @@ void Instance::ReportDeviceLoss(std::string_view operation) const {
                          "{}={}, instances={}, {}={}x{}x{}, indexed={}, predicated={}, "
                          "uses_dma={}, color_attachments={}, depth_attachment={}, "
                          "stencil_attachment={}, writable_buffers={}, writable_images={}, "
-                         "shader_hashes={}, {}=[{:#x}->{:#x}, size={:#x}, generations={}->{}, "
-                         "source_offset={:#x}], pointer={}",
+                         "shader_hashes={}, {}=[{:#x}, size={:#x}, generation={}, "
+                         "source_offset={:#x}{}], pointer={}",
                          i, vk::to_string(checkpoint.stage), record->serial,
                          CheckpointName(record->checkpoint), context.pipeline_hash, items_label,
                          context.item_count, instances, groups_label, context.group_x,
@@ -268,9 +280,8 @@ void Instance::ReportDeviceLoss(std::string_view operation) const {
                          context.has_depth_attachment, context.has_stencil_attachment,
                          context.writable_buffer_count, context.writable_image_count,
                          context.shader_hashes, transfer_label, context.source_guest_address,
-                         context.destination_guest_address, context.transfer_size,
-                         context.source_generation, context.destination_generation,
-                         context.source_offset, checkpoint.pCheckpointMarker);
+                         context.transfer_size, context.source_generation, context.source_offset,
+                         count_buffer, checkpoint.pCheckpointMarker);
             const size_t buffer_count =
                 std::min<size_t>(context.writable_buffer_count, context.writable_buffers.size());
             for (size_t resource = 0; resource < buffer_count; ++resource) {
@@ -1014,8 +1025,14 @@ void Instance::CollectPhysicalMemoryInfo() {
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
     if (!IsIntegrated()) {
-        // We reserve some memory for the system.
-        const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
+        // We reserve some memory for the system. With VK_EXT_memory_budget the driver's budget
+        // already tracks other consumers live, so only a small safety margin is needed on top;
+        // a large static reserve double-counts and forces eviction thrash at a ceiling well
+        // below what the system tolerates (Run 33: assets cycled at 4.79 GiB while 5.34 GiB
+        // was in use without incident).
+        const u64 system_memory = supports_memory_budget
+                                      ? std::min<u64>(total_memory_budget / 16, 384_MB)
+                                      : std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
         return;
     }
