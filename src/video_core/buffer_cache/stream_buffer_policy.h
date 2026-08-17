@@ -24,9 +24,11 @@ constexpr u32 StreamGrowthLookahead = 4;
 constexpr VAddr StreamGrowthProportionalMaximum = 64_MB;
 constexpr u32 StreamGrowthProportionShift = 3;
 // Sparse cache buffers bind reserve pages only when they are first touched, so their reserve costs
-// address space rather than memory: reserve as much as the buffer already holds (a full step of
-// geometric growth), bounded so a single buffer's address range stays reasonable.
-constexpr VAddr SparseStreamGrowthMaximum = 256_MB;
+// address space rather than memory. It is still kept modest: a grow replacement under sparse is
+// cheap (new buffer + aliased blocks, no copy), while a huge reserve inflates every later span
+// (Run 29: a 24 KB request resolved to 306 MB) and widens the window of registered-but-unbound
+// pages whose device addresses are null.
+constexpr VAddr SparseStreamGrowthMaximum = 64_MB;
 
 [[nodiscard]] constexpr VAddr SparseStreamGrowthDistance(VAddr classic_distance,
                                                          VAddr natural_size) noexcept {

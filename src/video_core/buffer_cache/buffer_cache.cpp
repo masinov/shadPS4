@@ -1085,6 +1085,15 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
     ++stats.demand_bindings;
     stats.demand_bound_bytes += bound;
     scheduler.BindSparse(buffer.Handle(), sparse_binds);
+    // Reads of an unbound sparse range return undefined data on non-strict-residency hardware.
+    // A coverage accounting bug here would surface as transient garbage geometry, so verify the
+    // invariant at the only place that can restore it.
+    if (!buffer.IsRangeBound(offset, size)) {
+        LOG_ERROR(Render_Vulkan,
+                  "Sparse range still unbound after demand binding: buffer={:#x}, "
+                  "offset={:#x}, size={:#x}",
+                  buffer.CpuAddr(), offset, size);
+    }
     // Only registered buffers reach this path (every caller resolved the buffer through the page
     // table first), so the new pages can be published to direct-memory shaders immediately.
     for (const vk::SparseMemoryBind& bind : sparse_binds) {

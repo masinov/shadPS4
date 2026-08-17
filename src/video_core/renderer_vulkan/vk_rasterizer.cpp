@@ -738,9 +738,11 @@ void Rasterizer::OnSubmit() {
             LOG_INFO(Render_Vulkan,
                      "VRAM GC pass: inspected={}, evicted={} ({} MiB estimated), "
                      "skipped_gpu_modified={}, skipped_bound={}, skipped_in_flight={}, "
-                     "skipped_unallocated={}, remaining_target={} MiB, elapsed={} ms",
+                     "skipped_unallocated={}, skipped_small={}, remaining_target={} MiB, "
+                     "elapsed={} ms",
                      inspected, evicted, reclaimed / 1_MB, skipped_modified,
                      texture_result.skipped_bound, skipped_in_flight, skipped_unallocated,
+                     texture_result.skipped_small + buffer_result.skipped_small,
                      gc_budget.bytes_remaining / 1_MB, gc_elapsed);
         } else if (pressure_changed && gc_budget.pressure == VideoCore::GcPressure::None) {
             LOG_INFO(Render_Vulkan, "VRAM GC pressure cleared at {} MiB usage", used_memory / 1_MB);
