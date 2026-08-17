@@ -251,24 +251,26 @@ void Instance::ReportDeviceLoss(std::string_view operation) const {
                 context.indirect_arguments ? "max_draw_commands" : "items";
             const std::string_view transfer_label =
                 context.indirect_arguments ? "arguments" : "transfer";
+            const std::string_view groups_label =
+                context.record_time_groups ? "record_time_groups" : "groups";
             LOG_CRITICAL(Render_Vulkan,
                          "NVIDIA checkpoint #{}: stage={}, serial={}, marker='{}', pipeline={:#x}, "
-                         "{}={}, instances={}, groups={}x{}x{}, indexed={}, predicated={}, "
+                         "{}={}, instances={}, {}={}x{}x{}, indexed={}, predicated={}, "
                          "uses_dma={}, color_attachments={}, depth_attachment={}, "
                          "stencil_attachment={}, writable_buffers={}, writable_images={}, "
                          "shader_hashes={}, {}=[{:#x}->{:#x}, size={:#x}, generations={}->{}, "
                          "source_offset={:#x}], pointer={}",
                          i, vk::to_string(checkpoint.stage), record->serial,
                          CheckpointName(record->checkpoint), context.pipeline_hash, items_label,
-                         context.item_count, instances, context.group_x, context.group_y,
-                         context.group_z, context.indexed, context.predicated, context.uses_dma,
-                         context.color_attachment_count, context.has_depth_attachment,
-                         context.has_stencil_attachment, context.writable_buffer_count,
-                         context.writable_image_count, context.shader_hashes, transfer_label,
-                         context.source_guest_address, context.destination_guest_address,
-                         context.transfer_size, context.source_generation,
-                         context.destination_generation, context.source_offset,
-                         checkpoint.pCheckpointMarker);
+                         context.item_count, instances, groups_label, context.group_x,
+                         context.group_y, context.group_z, context.indexed, context.predicated,
+                         context.uses_dma, context.color_attachment_count,
+                         context.has_depth_attachment, context.has_stencil_attachment,
+                         context.writable_buffer_count, context.writable_image_count,
+                         context.shader_hashes, transfer_label, context.source_guest_address,
+                         context.destination_guest_address, context.transfer_size,
+                         context.source_generation, context.destination_generation,
+                         context.source_offset, checkpoint.pCheckpointMarker);
             const size_t buffer_count =
                 std::min<size_t>(context.writable_buffer_count, context.writable_buffers.size());
             for (size_t resource = 0; resource < buffer_count; ++resource) {

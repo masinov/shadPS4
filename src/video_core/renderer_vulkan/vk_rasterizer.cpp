@@ -465,6 +465,25 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     predication.BeginDraw(cmdbuf, std::nullopt, predicated);
+    // Snapshot the argument values as guest memory holds them now. For CPU-written arguments
+    // this is what the GPU will read; for GPU-written (async-compute patched) dispatches it is a
+    // stale-but-informative record-time view. Run 31 lost the device at this dispatch class with
+    // sparse both on and off, so the arguments themselves are the prime suspect.
+    std::array<u32, 3> record_groups{};
+    std::memcpy(record_groups.data(), reinterpret_cast<const void*>(address + offset),
+                std::min<size_t>(sizeof(record_groups), size));
+    constexpr u32 MaxSaneGroups = 65535; // PS4 dispatch dimension limit
+    if (record_groups[0] > MaxSaneGroups || record_groups[1] > MaxSaneGroups ||
+        record_groups[2] > MaxSaneGroups ||
+        VideoCore::ShouldLogDiagnosticSample(++indirect_dispatch_log_count)) {
+        LOG_INFO(Render_Vulkan,
+                 "Indirect dispatch: args_addr={:#x}, record_groups={}x{}x{}, on_gpu={}, "
+                 "generation={}, sane={}",
+                 address + offset, record_groups[0], record_groups[1], record_groups[2], on_gpu,
+                 buffer->address_generation,
+                 record_groups[0] <= MaxSaneGroups && record_groups[1] <= MaxSaneGroups &&
+                     record_groups[2] <= MaxSaneGroups);
+    }
     if (instance.HasDiagnosticCheckpoints()) {
         auto checkpoint =
             MakeCheckpointContext(*pipeline, pipeline->GetKeyHash(), false, predicated);
@@ -473,6 +492,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
         checkpoint.transfer_size = size;
         checkpoint.source_generation = buffer->address_generation;
         checkpoint.source_offset = base;
+        checkpoint.group_x = record_groups[0];
+        checkpoint.group_y = record_groups[1];
+        checkpoint.group_z = record_groups[2];
+        checkpoint.record_time_groups = true;
         instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::IndirectDispatch, checkpoint);
     }
     cmdbuf.dispatchIndirect(buffer->Handle(), base);

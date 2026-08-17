@@ -187,6 +187,7 @@ private:
     u32 gc_submit_count{};
     u32 gc_log_count{};
     u32 cache_stats_log_count{};
+    u64 indirect_dispatch_log_count{};
     u32 memory_allocator_frame_index{};
     u64 allocation_gc_pass_count{};
     bool gc_texture_first{true};

@@ -73,7 +73,10 @@ struct GcResult {
 // call makes a resource used every frame look "old" between two draws of the same frame. That
 // evicts hot streaming buffers which are then rebuilt piecewise and re-merged with full copies.
 [[nodiscard]] constexpr u64 GcMinimumAge(GcPressure pressure) noexcept {
-    return pressure == GcPressure::Critical ? 8 : 32;
+    // Epochs advance once per guest submission (tens per second). The previous 8/32 made assets
+    // idle for a fraction of a second evictable; Run 31 showed that as visible eviction/re-upload
+    // bursts once the collector could actually reach large objects. Roughly two / eight seconds.
+    return pressure == GcPressure::Critical ? 64 : 256;
 }
 
 // CurrentTick is the signal value reserved for the command buffer still being recorded. A

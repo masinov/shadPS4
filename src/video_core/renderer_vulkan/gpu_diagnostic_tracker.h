@@ -54,9 +54,13 @@ struct GpuCheckpointContext {
     /// Direct draws only. Indirect draws read their instance count from the argument buffer on
     /// the GPU; the CPU never observes it, so this stays zero and must not be reported as data.
     u32 instance_count{};
+    /// Direct dispatches: the actual dimensions. Indirect dispatches: the argument values read
+    /// from guest memory at record time; if the GPU writes them later (async-compute patched
+    /// dispatches), the executed values may differ — record_time_groups marks that case.
     u32 group_x{};
     u32 group_y{};
     u32 group_z{};
+    bool record_time_groups{};
     u16 writable_buffer_count{};
     u16 writable_image_count{};
     u8 color_attachment_count{};
