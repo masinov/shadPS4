@@ -273,6 +273,8 @@ public:
         u64 block_reclaim_age{}; ///< sparse: current adaptive age threshold, in GC epochs
         u64 reinstatements{};    ///< sparse: victim-stage blocks recalled for free
         u64 reinstated_bytes{};
+        u64 limbo_rescued{}; ///< sparse: expired blocks kept because GPU data arrived in limbo
+        u64 limbo_rescued_bytes{};
         u64 limbo_bytes{}; ///< sparse: bytes currently in the victim stage (still resident)
         u64 ghost_hits{};  ///< sparse: demand binds that re-bound a reclaimed range
         u64 ghost_hit_bytes{};

@@ -138,9 +138,16 @@ constexpr u32 GcMaxCheapScans = 16384;
 /// fault path but costs a transient zero read.
 /// Grace period, in GC epochs, that a reclaimed sparse block spends in the victim stage with
 /// its memory and binding intact. Demand within the window reinstates it for free; only blocks
-/// that survive it unreferenced are actually unbound. Short: pressure exists while sweeping, so
-/// condemned memory should free promptly - the ghost pins handle repeat offenders.
-constexpr u64 LimboGraceEpochs = 32;
+/// that survive it unreferenced are actually unbound. Run 46 measured 4.8 GiB of post-release
+/// revisits against 0.5 GiB of in-limbo reinstatements at a 32-epoch grace: most of the revisit
+/// mass sits above 32, so the normal tier now covers the histogram's dominant band, and only
+/// genuine pressure shortens the stay.
+[[nodiscard]] constexpr u64 LimboGraceEpochs(GcPressure pressure, bool overshoot) noexcept {
+    if (pressure == GcPressure::Critical || overshoot) {
+        return 32;
+    }
+    return 192;
+}
 
 [[nodiscard]] constexpr u64 SparseBlockReclaimMinAge(GcPressure pressure,
                                                      bool overshoot = false) noexcept {

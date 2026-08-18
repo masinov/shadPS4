@@ -170,11 +170,12 @@ struct UniqueBuffer {
     /// actually unbound, and that unbind is deferred and ordered after the recording batch.
     template <typename CanDrop>
     u64 MoveColdBlocksToLimbo(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
-                              CanDrop&& can_drop) {
+                              bool override_pins, CanDrop&& can_drop) {
         u64 moved = 0;
         for (auto it = sparse_blocks.begin(); it != sparse_blocks.end() && moved < max_bytes;) {
-            if (it->last_use_epoch >= cutoff_epoch || it->min_reclaim_epoch > current_epoch ||
-                !it->owned || !can_drop(it->buffer_offset, it->size)) {
+            if (it->last_use_epoch >= cutoff_epoch ||
+                (it->min_reclaim_epoch > current_epoch && !override_pins) || !it->owned ||
+                !can_drop(it->buffer_offset, it->size)) {
                 ++it;
                 continue;
             }
@@ -220,14 +221,33 @@ struct UniqueBuffer {
     /// Removes limbo blocks whose grace period ended, emitting the null-memory unbind operations
     /// (the caller defers them behind the recording batch) and the allocations to free once the
     /// unbind has executed. on_expired runs per block before removal.
-    template <typename OnExpired>
-    u64 CollectExpiredLimbo(u64 expiry_epoch, OnExpired&& on_expired,
+    /// can_release re-validates each expired block: admission checked that the range held no
+    /// GPU-authored data, but the grace period is long enough for direct-memory GPU writes to
+    /// land in a limbo block (its BDA entries stay valid), and releasing such a block would
+    /// silently discard that data. Blocks failing the check are reinstated instead.
+    template <typename CanRelease, typename OnExpired, typename OnRescued>
+    u64 CollectExpiredLimbo(u64 expiry_epoch, u64 current_epoch, CanRelease&& can_release,
+                            OnExpired&& on_expired, OnRescued&& on_rescued,
                             std::vector<vk::SparseMemoryBind>& out_unbinds,
                             std::vector<VmaAllocation>& out_allocations) {
         u64 released = 0;
         for (auto it = limbo_blocks.begin(); it != limbo_blocks.end();) {
             if (it->limbo_epoch > expiry_epoch) {
                 ++it;
+                continue;
+            }
+            if (!can_release(it->buffer_offset, it->size)) {
+                SparseBlock block = *it;
+                it = limbo_blocks.erase(it);
+                limbo_bytes -= block.size;
+                on_rescued(block.buffer_offset, block.size);
+                block.last_use_epoch = current_epoch;
+                block.limbo_epoch = 0;
+                const auto insert_at = std::ranges::upper_bound(sparse_blocks, block.buffer_offset,
+                                                                {}, &SparseBlock::buffer_offset);
+                sparse_blocks.insert(insert_at, block);
+                sparse_coverage.Add(block.buffer_offset, block.size);
+                sparse_bound_bytes += block.size;
                 continue;
             }
             out_unbinds.push_back(vk::SparseMemoryBind{
@@ -307,8 +327,8 @@ public:
     /// Sparse buffers only. See UniqueBuffer::MoveColdBlocksToLimbo.
     template <typename CanDrop>
     u64 MoveColdSparseBlocksToLimbo(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
-                                    CanDrop&& can_drop) {
-        return buffer.MoveColdBlocksToLimbo(cutoff_epoch, current_epoch, max_bytes,
+                                    bool override_pins, CanDrop&& can_drop) {
+        return buffer.MoveColdBlocksToLimbo(cutoff_epoch, current_epoch, max_bytes, override_pins,
                                             std::forward<CanDrop>(can_drop));
     }
 
@@ -322,12 +342,15 @@ public:
     }
 
     /// Sparse buffers only. See UniqueBuffer::CollectExpiredLimbo.
-    template <typename OnExpired>
-    u64 CollectExpiredSparseLimbo(u64 expiry_epoch, OnExpired&& on_expired,
+    template <typename CanRelease, typename OnExpired, typename OnRescued>
+    u64 CollectExpiredSparseLimbo(u64 expiry_epoch, u64 current_epoch, CanRelease&& can_release,
+                                  OnExpired&& on_expired, OnRescued&& on_rescued,
                                   std::vector<vk::SparseMemoryBind>& out_unbinds,
                                   std::vector<VmaAllocation>& out_allocations) {
         const u64 released = buffer.CollectExpiredLimbo(
-            expiry_epoch, std::forward<OnExpired>(on_expired), out_unbinds, out_allocations);
+            expiry_epoch, current_epoch, std::forward<CanRelease>(can_release),
+            std::forward<OnExpired>(on_expired), std::forward<OnRescued>(on_rescued), out_unbinds,
+            out_allocations);
         allocation_size = buffer.sparse_bound_bytes + buffer.limbo_bytes;
         return released;
     }

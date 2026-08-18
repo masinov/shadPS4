@@ -1538,7 +1538,9 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
     // valid state), and the unbind itself is deferred to the next submission, where it waits for
     // this batch's completion on the master timeline. Run 45's corruption came from the inverse
     // order: the unbind executed before the batch whose draws still read the entries.
-    const u64 limbo_expiry = gc_tick > LimboGraceEpochs ? gc_tick - LimboGraceEpochs : 0;
+    const bool pressure_override = budget.pressure == GcPressure::Critical || budget.overshoot;
+    const u64 limbo_grace = LimboGraceEpochs(budget.pressure, budget.overshoot);
+    const u64 limbo_expiry = gc_tick > limbo_grace ? gc_tick - limbo_grace : 0;
     ForEachBufferInRange(0, std::numeric_limits<VAddr>::max(), [&](BufferId id, Buffer& buffer) {
         if (!buffer.IsSparse() || buffer.is_deleted) {
             return;
@@ -1546,7 +1548,16 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
         std::vector<vk::SparseMemoryBind> unbinds;
         std::vector<VmaAllocation> freed;
         const u64 released = buffer.CollectExpiredSparseLimbo(
-            limbo_expiry,
+            limbo_expiry, gc_tick,
+            [&](u64 offset, u64 block_size) {
+                const VAddr addr = buffer.CpuAddr() + offset;
+                // Re-validated at release: direct-memory GPU writes may have landed in the block
+                // while its BDA entries were still live. Run 46's "brief thin lines" with zero
+                // fault lines fit exactly this shape of silent data loss.
+                return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
+                       !preemptive_downloads.Intersects(addr, block_size) &&
+                       !IsRegionGpuModified(addr, block_size);
+            },
             [&](u64 offset, u64 block_size) {
                 const VAddr addr = buffer.CpuAddr() + offset;
                 // Metadata ghost per 64 KiB page: a later demand bind of this range reveals the
@@ -1564,6 +1575,10 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
                     bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
                 bda_pagetable_buffer.Fill(pt_offset,
                                           (page_end - page_begin) * sizeof(vk::DeviceAddress), 0);
+            },
+            [&](u64 offset, u64 block_size) {
+                ++stats.limbo_rescued;
+                stats.limbo_rescued_bytes += block_size;
             },
             unbinds, freed);
         if (unbinds.empty()) {
@@ -1590,7 +1605,7 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
             return;
         }
         const u64 moved = buffer.MoveColdSparseBlocksToLimbo(
-            cutoff, gc_tick, sweep_cap, [&](u64 offset, u64 block_size) {
+            cutoff, gc_tick, sweep_cap, pressure_override, [&](u64 offset, u64 block_size) {
                 const VAddr addr = buffer.CpuAddr() + offset;
                 return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
                        !preemptive_downloads.Intersects(addr, block_size) &&
