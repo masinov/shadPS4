@@ -295,6 +295,36 @@ BufferCache::VertexBufferBinding BufferCache::PrepareVertexBuffers(
                            buffer.base_address < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
+            // World geometry corrupts through this path while compute-skinned meshes stay
+            // intact (runs 40-54), and on drivers with vertex-input dynamic state the bind
+            // carries no per-binding size, so any fetch past the obtained span reads the sparse
+            // buffer's unbound reserve as zeros - stretched-triangle geometry with no fault.
+            // Verify the declared V# extent is resident in the resolved buffer and count/log
+            // violations: each hit is a would-be corruption with addresses attached.
+            if (sparse_buffers) {
+                const VAddr attr_end = buffer.base_address + buffer.GetSize();
+                const BufferId owner_id =
+                    page_table[buffer.base_address >> CACHING_PAGEBITS].buffer_id;
+                if (owner_id && !IsBufferInvalid(owner_id)) {
+                    Buffer& owner = slot_buffers[owner_id];
+                    if (owner.IsSparse() &&
+                        owner.IsInBounds(buffer.base_address, buffer.GetSize()) &&
+                        !owner.IsRangeBound(owner.Offset(buffer.base_address), buffer.GetSize())) {
+                        ++stats.vertex_residency_misses;
+                        if (ShouldLogDiagnosticSample(++vertex_residency_log_count)) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Vertex binding not fully resident: attr=[{:#x},{:#x}), "
+                                        "buffer=[{:#x},{:#x}), stride={}",
+                                        buffer.base_address, attr_end, owner.CpuAddr(),
+                                        owner.CpuAddr() + owner.SizeBytes(), buffer.GetStride());
+                        }
+                        // Self-heal losslessly: bind and synchronize the declared extent so the
+                        // draw reads real guest data exactly as hardware would.
+                        SynchronizeBuffer(owner, buffer.base_address,
+                                          static_cast<u32>(buffer.GetSize()), false, false);
+                    }
+                }
+            }
             binding.host_buffers.emplace_back(host_buffer_info->vk_buffer);
             binding.host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                            host_buffer_info->base_address);
@@ -777,7 +807,23 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         // matching guest addresses and takes over their ownership. The old buffer keeps its own
         // bindings until it is retired at its last-use tick, so commands already recorded against
         // it stay valid; the caller submits the bind operations once for the whole replacement.
+        const u64 absorbed_bytes = overlap.buffer.sparse_bound_bytes + overlap.buffer.limbo_bytes;
+        const u64 successor_before =
+            new_buffer.buffer.sparse_bound_bytes + new_buffer.buffer.limbo_bytes;
         new_buffer.TakeOverBlocks(overlap, sparse_binds);
+        const u64 successor_gained =
+            new_buffer.buffer.sparse_bound_bytes + new_buffer.buffer.limbo_bytes - successor_before;
+        if (successor_gained != absorbed_bytes) {
+            // A silent partial takeover would leave previously-resident guest ranges unbound in
+            // the successor: exactly the zero-read geometry class. Never observed; verified on
+            // every merge because the check costs two additions.
+            ++stats.takeover_mismatches;
+            LOG_ERROR(Render_Vulkan,
+                      "Sparse takeover mismatch: absorbed [{:#x},{:#x}) held {} bytes but the "
+                      "successor gained {}",
+                      overlap.CpuAddr(), overlap.CpuAddr() + overlap.SizeBytes(), absorbed_bytes,
+                      successor_gained);
+        }
         MarkBufferUsed(overlap);
         MarkBufferUsed(new_buffer);
         DeleteBuffer(overlap_id);
