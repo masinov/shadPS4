@@ -260,6 +260,7 @@ public:
 
     struct Statistics {
         u64 replacements{};        ///< CreateBuffer calls
+        u64 stale_slot_rebinds{};  ///< binding hints that pointed at a reused slot (raced GC)
         u64 replacements_new{};    ///< ... with no overlap
         u64 replacements_grow{};   ///< ... with exactly one overlap
         u64 replacements_bridge{}; ///< ... with two or more overlaps

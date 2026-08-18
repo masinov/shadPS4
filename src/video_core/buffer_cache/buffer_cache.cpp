@@ -509,6 +509,23 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
 
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size, allow_texture_gc);
+    } else if (!slot_buffers[buffer_id].IsInBounds(device_addr, size)) {
+        // Slot reuse defeats the is_deleted revalidation: allocation-GC retirements execute on
+        // this thread and can run between a shader binding's pass-1 resolve and its pass-2 use
+        // (any obtain in between may trigger ReclaimForAllocation), after which a subsequent
+        // CreateBuffer recycles the freed slot for an unrelated range. Bounds held when the hint
+        // was captured and buffers never shrink, so a bounds failure here means exactly that
+        // race - resolving through the stale id would build a descriptor into a different live
+        // buffer at a garbage offset: silent vertex/uniform corruption. The image path pins its
+        // pass-1 captures via binding.is_bound; buffers get this revalidation instead.
+        ++stats.stale_slot_rebinds;
+        LOG_WARNING(Render_Vulkan,
+                    "Stale buffer binding hint: slot {} now holds [{:#x},{:#x}) while resolving "
+                    "[{:#x},{:#x}); re-resolving",
+                    buffer_id.index, slot_buffers[buffer_id].CpuAddr(),
+                    slot_buffers[buffer_id].CpuAddr() + slot_buffers[buffer_id].SizeBytes(),
+                    device_addr, device_addr + size);
+        buffer_id = FindBuffer(device_addr, size, allow_texture_gc);
     }
 
     Buffer& buffer = slot_buffers[buffer_id];
