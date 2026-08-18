@@ -598,7 +598,12 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::MarkRegionAsFlushed(VAddr addr, size_t size) {
     gpu_modified_ranges.Subtract(addr, size);
-    memory_tracker->UnmarkRegionAsGpuModified(addr, size, true);
+    // is_write=false: transfer eviction authority only. Marking the range CPU-dirty here would
+    // make the next buffer sync upload the written-back tiled texel bytes into every covering
+    // buffer's device copy — Run 38's static exploding geometry. Device buffer copies keep the
+    // content they always had; no data flow exists after this call that did not exist before
+    // eviction readback was introduced.
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
 }
 
 void BufferCache::MarkRegionAsCpuModified(VAddr addr, size_t size) {

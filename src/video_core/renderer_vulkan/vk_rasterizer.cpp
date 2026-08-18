@@ -785,10 +785,11 @@ void Rasterizer::OnSubmit() {
             const auto readback_stats = texture_cache.GetReadbackStats();
             LOG_INFO(Render_Vulkan,
                      "Eviction readback: nominated={}, applied={}, aborted_dirty={}, "
-                     "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}",
+                     "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}, "
+                     "converted_aliases={}",
                      readback_stats.nominated, readback_stats.applied, readback_stats.aborted_dirty,
                      readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
-                     readback_stats.aborted_image_alias);
+                     readback_stats.aborted_image_alias, readback_stats.converted_aliases);
             LOG_INFO(Render_Vulkan,
                      "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
                      "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "

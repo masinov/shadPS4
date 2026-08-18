@@ -6,6 +6,7 @@
 #include <limits>
 #include <vector>
 
+#include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -272,8 +273,13 @@ void TextureCache::ApplyReadyReadbacks() {
                                                   readback.data.data(), readback.data.size());
         image.flags &= ~ImageFlagBits::GpuModified;
         buffer_cache.MarkRegionAsFlushed(readback.guest_address, readback.guest_size);
-        // Dominated aliases (older, fully contained) are superseded byte-for-byte by the written
-        // range. Their device copies are stale; make guest memory their source of truth too.
+        // Dominated aliases lose GpuModified so a later pass can evict them, and nothing else:
+        // their device copies keep serving exactly what they served before (Run 38's CpuDirty
+        // conversion re-uploaded them from the dominant's re-tiled bytes — hence bricks rendering
+        // their normal map). Should one be evicted and re-accessed, it re-creates from guest
+        // memory, which now holds the dominant's bytes — the same bytes it would read on
+        // hardware.
+        u32 converted = 0;
         ForEachImageInRegion(readback.guest_address, readback.guest_size,
                              [&](ImageId other_id, Image& other) {
                                  if (other_id == readback.image_id ||
@@ -281,8 +287,15 @@ void TextureCache::ApplyReadyReadbacks() {
                                      return;
                                  }
                                  other.flags &= ~ImageFlagBits::GpuModified;
-                                 other.flags |= ImageFlagBits::CpuDirty;
+                                 ++converted;
                              });
+        readback_stats.converted_aliases += converted;
+        LOG_INFO(Render_Vulkan,
+                 "Eviction readback applied: image={}, addr={:#x}, size={:#x}, format={}, "
+                 "tile_mode={}, converted_aliases={}",
+                 readback.image_id.index, readback.guest_address, readback.guest_size,
+                 vk::to_string(image.info.pixel_format),
+                 magic_enum::enum_name(image.info.tile_mode), converted);
     }
 }
 
@@ -1225,10 +1238,11 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             // GPU-authored contents cannot be discarded, but they can be written back to guest
             // memory asynchronously; once that completes the image is CPU-authoritative and a
             // later pass can evict it. Nominate a bounded number of large candidates per pass.
-            if (False(image.flags & ImageFlagBits::EvictionReadback) &&
+            if (Config::getUseEvictionReadback() &&
+                False(image.flags & ImageFlagBits::EvictionReadback) &&
                 False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&
-                image.AllocationSizeBytes() >= 4_MB && eviction_readbacks.size() < 4 &&
+                image.AllocationSizeBytes() >= 2_MB && eviction_readbacks.size() < 8 &&
                 !buffer_cache.IsRegionGpuModified(image.info.guest_address,
                                                   image.info.guest_size) &&
                 IsReadbackViable(image_id, image)) {

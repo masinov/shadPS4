@@ -373,6 +373,27 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     });
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    // The image copies only cover texel extents; pitch/slice padding in the scratch buffer would
+    // otherwise be whatever the freshly allocated VRAM happens to contain, and the tiler writes
+    // every byte of guest_size — leaking uninitialized device memory into guest padding bytes.
+    // Zero the scratch first so the written-back padding is deterministic.
+    cmdbuf.fillBuffer(temp_buffer, 0, info.guest_size, 0);
+    const vk::BufferMemoryBarrier2 fill_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask =
+            vk::PipelineStageFlagBits2::eCopy | vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask =
+            vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderStorageRead,
+        .buffer = temp_buffer,
+        .offset = 0,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &fill_barrier,
+    });
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));

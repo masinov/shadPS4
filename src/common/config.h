@@ -244,6 +244,7 @@ void setExtraDmemInMbytes(int value);
 bool getUseHostMemoryFallback();
 void setUseHostMemoryFallback(bool enable);
 bool getUseSparseCacheBuffers();
+bool getUseEvictionReadback();
 void setUseSparseCacheBuffers(bool enable);
 int getMemoryCompressionLevel();
 void setMemoryCompressionLevel(int level);

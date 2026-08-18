@@ -376,6 +376,7 @@ public:
         u64 aborted_reused{};
         u64 aborted_buffer_alias{};
         u64 aborted_image_alias{};
+        u64 converted_aliases{};
     };
 
     [[nodiscard]] ReadbackStats GetReadbackStats() const noexcept {
