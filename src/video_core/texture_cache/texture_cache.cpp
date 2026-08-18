@@ -91,7 +91,12 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
 
-    const auto [mapping_data, mapping_offset] = download_buffer.Map(copy_size, true);
+    // The mapped offset becomes a storage-buffer descriptor offset for the tiler dispatch, so it
+    // must satisfy minStorageBufferOffsetAlignment. The previous Map(copy_size, true) call passed
+    // `true` as the *alignment* parameter (= 1 byte): on drivers that round a misaligned
+    // descriptor offset down, every tiler write landed shifted into the preceding staged block.
+    const auto [mapping_data, mapping_offset] =
+        download_buffer.Map(copy_size, instance.StorageMinAlignment());
     tile_manager.TileImage(image, buffer_copies, download_buffer.Handle(), mapping_offset,
                            copy_size);
 
@@ -189,8 +194,13 @@ void TextureCache::RecordEvictionReadbacks() {
             clear_flag();
             continue;
         }
-        // Never wait for staging space here; a full ring simply retries on a later pass.
-        const auto [mapping_data, mapping_offset] = download_buffer.Map(copy_size, 1, false);
+        // Never wait for staging space here; a full ring simply retries on a later pass. The
+        // offset feeds the tiler's storage-buffer descriptor: align it, or the driver rounds a
+        // misaligned offset down and the dispatch writes into the previous staged block — the
+        // Run 36/39/40 geometry-corruption class (vertex downloads clobbered in the ring, then
+        // written back to guest memory), which the Run 41 A/B isolated to the readback path.
+        const auto [mapping_data, mapping_offset] =
+            download_buffer.Map(copy_size, instance.StorageMinAlignment(), false);
         if (!mapping_data) {
             ++readback_stats.aborted_no_staging;
             clear_flag();

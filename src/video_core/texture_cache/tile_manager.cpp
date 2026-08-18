@@ -199,7 +199,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer,
         .offset = in_offset,
-        .range = VK_WHOLE_SIZE,
+        .range = info.guest_size,
     };
 
     const vk::DescriptorBufferInfo linear_buffer_info{
@@ -401,7 +401,10 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer,
         .offset = out_offset,
-        .range = VK_WHOLE_SIZE,
+        // Not VK_WHOLE_SIZE: the output lands in the shared download ring, and bounding the
+        // descriptor makes robust access clamp any out-of-range tiled address instead of letting
+        // it corrupt neighbouring staged downloads.
+        .range = info.guest_size,
     };
 
     const vk::DescriptorBufferInfo linear_buffer_info{
