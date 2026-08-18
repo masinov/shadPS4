@@ -58,7 +58,8 @@ struct SparseBlock {
     VkDeviceSize buffer_offset{};
     VkDeviceSize size{};
     bool owned{};
-    u64 last_use_epoch{}; ///< GC epoch of the last synchronized access covering this block
+    u64 last_use_epoch{};    ///< GC epoch of the last synchronized access covering this block
+    u64 min_reclaim_epoch{}; ///< Ghost-hit protection: not reclaimable before this epoch
 };
 
 struct UniqueBuffer {
@@ -131,6 +132,22 @@ struct UniqueBuffer {
 
     [[nodiscard]] bool IsRangeBound(VkDeviceSize offset, VkDeviceSize size) const noexcept;
 
+    /// Raises the reclaim floor of every block overlapping [offset, offset + size): a block
+    /// whose range round-tripped through the reclaimer is individually exempt for a period
+    /// scaled to its measured re-reference distance, instead of dragging a global threshold.
+    void ProtectRange(VkDeviceSize offset, VkDeviceSize size, u64 until_epoch) noexcept {
+        auto it = std::ranges::upper_bound(sparse_blocks, offset, {}, &SparseBlock::buffer_offset);
+        if (it != sparse_blocks.begin()) {
+            --it;
+        }
+        const VkDeviceSize end = offset + size;
+        for (; it != sparse_blocks.end() && it->buffer_offset < end; ++it) {
+            if (it->buffer_offset + it->size > offset) {
+                it->min_reclaim_epoch = std::max(it->min_reclaim_epoch, until_epoch);
+            }
+        }
+    }
+
     /// Stamps the GC epoch on every block overlapping [offset, offset + size).
     void TouchRange(VkDeviceSize offset, VkDeviceSize size, u64 epoch) noexcept {
         auto it = std::ranges::upper_bound(sparse_blocks, offset, {}, &SparseBlock::buffer_offset);
@@ -149,12 +166,12 @@ struct UniqueBuffer {
     /// up to max_bytes. Appends null-memory bind operations (the caller submits them) and hands
     /// each dropped block's allocation to on_drop for deferred release. Returns bytes unbound.
     template <typename CanDrop, typename OnDrop>
-    u64 ReclaimColdBlocks(u64 cutoff_epoch, u64 max_bytes, CanDrop&& can_drop, OnDrop&& on_drop,
-                          std::vector<vk::SparseMemoryBind>& out_binds) {
+    u64 ReclaimColdBlocks(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes, CanDrop&& can_drop,
+                          OnDrop&& on_drop, std::vector<vk::SparseMemoryBind>& out_binds) {
         u64 reclaimed = 0;
         for (auto it = sparse_blocks.begin(); it != sparse_blocks.end() && reclaimed < max_bytes;) {
-            if (it->last_use_epoch >= cutoff_epoch || !it->owned ||
-                !can_drop(it->buffer_offset, it->size)) {
+            if (it->last_use_epoch >= cutoff_epoch || it->min_reclaim_epoch > current_epoch ||
+                !it->owned || !can_drop(it->buffer_offset, it->size)) {
                 ++it;
                 continue;
             }
@@ -232,13 +249,21 @@ public:
 
     /// Sparse buffers only. See UniqueBuffer::ReclaimColdBlocks.
     template <typename CanDrop, typename OnDrop>
-    u64 ReclaimColdSparseBlocks(u64 cutoff_epoch, u64 max_bytes, CanDrop&& can_drop,
-                                OnDrop&& on_drop, std::vector<vk::SparseMemoryBind>& out_binds) {
-        const u64 reclaimed =
-            buffer.ReclaimColdBlocks(cutoff_epoch, max_bytes, std::forward<CanDrop>(can_drop),
-                                     std::forward<OnDrop>(on_drop), out_binds);
+    u64 ReclaimColdSparseBlocks(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
+                                CanDrop&& can_drop, OnDrop&& on_drop,
+                                std::vector<vk::SparseMemoryBind>& out_binds) {
+        const u64 reclaimed = buffer.ReclaimColdBlocks(cutoff_epoch, current_epoch, max_bytes,
+                                                       std::forward<CanDrop>(can_drop),
+                                                       std::forward<OnDrop>(on_drop), out_binds);
         allocation_size = buffer.sparse_bound_bytes;
         return reclaimed;
+    }
+
+    /// Sparse buffers only: exempts blocks in the range from reclaim until until_epoch.
+    void ProtectSparseRange(u64 offset, u64 size, u64 until_epoch) noexcept {
+        if (buffer.is_sparse) {
+            buffer.ProtectRange(offset, size, until_epoch);
+        }
     }
 
     /// Sparse buffers only. Inherits every memory block of `other` (a buffer this one replaces)

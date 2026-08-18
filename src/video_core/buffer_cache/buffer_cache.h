@@ -5,6 +5,8 @@
 
 #include <functional>
 
+#include <array>
+#include <span>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
 
@@ -244,6 +246,10 @@ public:
     /// garbage collector when whole-buffer eviction leaves the budget unmet.
     void SweepColdSparseBlocks(GcBudget& budget, GcResult& result);
 
+    /// Ghost bookkeeping for demand binds: measures reclaim->rebind distances and protects the
+    /// rebound blocks. Only the binds newly created by the current call may be passed.
+    void NoteDemandBinds(Buffer& buffer, std::span<const vk::SparseMemoryBind> binds);
+
     /// Installs the rasterizer-owned shared collector used by pressured allocations.
     void SetAllocationReclaimCallback(std::function<void(u64, u64, bool, bool)> callback) {
         allocation_reclaim_callback = std::move(callback);
@@ -265,6 +271,11 @@ public:
         u64 block_reclaims{}; ///< sparse: cold blocks unbound by the GC sweep
         u64 block_reclaimed_bytes{};
         u64 block_reclaim_age{}; ///< sparse: current adaptive age threshold, in GC epochs
+        u64 ghost_hits{};        ///< sparse: demand binds that re-bound a reclaimed range
+        u64 ghost_hit_bytes{};
+        u64 ghost_live{};                ///< sparse: ghost entries currently tracked
+        std::array<u64, 6> ghost_dist{}; ///< re-reference distance histogram:
+                                         ///< <256, <512, <1024, <2048, <4096, >=4096 epochs
         bool sparse{};
     };
 
@@ -348,6 +359,13 @@ private:
     u64 adaptive_block_age = 256;
     u64 adapt_reclaimed_snapshot = 0;
     u64 adapt_demand_snapshot = 0;
+    u32 adapt_raise_streak = 0;
+    u32 adapt_lower_streak = 0;
+    // Ghost accounting of reclaimed ranges (metadata only): 64 KiB page -> reclaim epoch. A
+    // demand bind that hits a ghost measures the range's true re-reference distance; the
+    // rebound blocks are then individually exempted for twice that distance, so the hot subset
+    // stops round-tripping without raising the global threshold for genuinely cold memory.
+    tsl::robin_map<u64, u64> reclaim_ghosts;
     bool sparse_buffers{};
     u64 pressure_allocation_log_count{};
     u64 chain_advance_log_count{};

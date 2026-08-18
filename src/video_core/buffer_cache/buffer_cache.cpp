@@ -962,8 +962,12 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
         // Inherited blocks cover the absorbed buffers; the pages of the request itself may still be
         // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the
         // request stay unbound until they are first touched.
+        const size_t takeover_bind_count = sparse_binds.size();
         new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size, gc_tick,
                                allocation_failure_callback, sparse_binds);
+        NoteDemandBinds(
+            new_buffer,
+            std::span<const vk::SparseMemoryBind>(sparse_binds).subspan(takeover_bind_count));
         scheduler.BindSparse(new_buffer.Handle(), sparse_binds);
         if (!overlap.ids.empty()) {
             // Writes made through the retired handles must be visible through the aliasing one.
@@ -1098,6 +1102,42 @@ void BufferCache::WriteBdaEntries(const Buffer& buffer, u64 offset, u64 size) {
                     bda_addrs.size() * sizeof(vk::DeviceAddress));
 }
 
+void BufferCache::NoteDemandBinds(Buffer& buffer, std::span<const vk::SparseMemoryBind> binds) {
+    if (reclaim_ghosts.empty()) {
+        return;
+    }
+    for (const vk::SparseMemoryBind& bind : binds) {
+        const VAddr addr = buffer.CpuAddr() + bind.resourceOffset;
+        u64 max_distance = 0;
+        u64 hit_pages = 0;
+        for (VAddr page = addr; page < addr + bind.size; page += SPARSE_ALIGNMENT) {
+            const auto it = reclaim_ghosts.find(page >> 16);
+            if (it == reclaim_ghosts.end()) {
+                continue;
+            }
+            max_distance = std::max(max_distance, gc_tick - it->second);
+            ++hit_pages;
+            reclaim_ghosts.erase(it);
+        }
+        if (hit_pages == 0) {
+            continue;
+        }
+        ++stats.ghost_hits;
+        stats.ghost_hit_bytes += hit_pages * SPARSE_ALIGNMENT;
+        const u32 bucket = max_distance < 256    ? 0
+                           : max_distance < 512  ? 1
+                           : max_distance < 1024 ? 2
+                           : max_distance < 2048 ? 3
+                           : max_distance < 4096 ? 4
+                                                 : 5;
+        ++stats.ghost_dist[bucket];
+        // Twice the observed distance, clamped: enough that the next revisit at the same cadence
+        // finds the block still bound, without pinning it forever.
+        const u64 protection = std::clamp<u64>(2 * max_distance, 512, 8192);
+        buffer.ProtectSparseRange(bind.resourceOffset, bind.size, gc_tick + protection);
+    }
+}
+
 void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) {
     if (!buffer.IsSparse()) {
         return;
@@ -1124,6 +1164,7 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
     }
     ++stats.demand_bindings;
     stats.demand_bound_bytes += bound;
+    NoteDemandBinds(buffer, sparse_binds);
     scheduler.BindSparse(buffer.Handle(), sparse_binds);
     // Reads of an unbound sparse range return undefined data on non-strict-residency hardware.
     // A coverage accounting bug here would surface as transient garbage geometry, so verify the
@@ -1434,12 +1475,28 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
     const u64 demand_delta = stats.demand_bound_bytes - adapt_demand_snapshot;
     if (reclaimed_delta >= 64_MB) {
         // demand_bound_bytes also counts first-touch binds of genuinely new ranges, so the ratio
-        // overestimates round-tripping; that only errs toward keeping blocks longer.
+        // overestimates round-tripping; that only errs toward keeping blocks longer. Run 44's
+        // single-window reaction cycled 256<->4096 eleven times each way (a raise zeroes the very
+        // rebind signal that justified it), so adaptation now needs two consecutive windows on
+        // the same side, and the ceiling is 2048: the 4096 band cost ~478 MiB of average usage
+        // for 65-82 MiB of reclaim per window.
         const u64 previous_age = adaptive_block_age;
-        if (demand_delta * 2 >= reclaimed_delta && adaptive_block_age < 4096) {
+        if (demand_delta * 2 >= reclaimed_delta) {
+            ++adapt_raise_streak;
+            adapt_lower_streak = 0;
+        } else if (demand_delta * 8 <= reclaimed_delta) {
+            ++adapt_lower_streak;
+            adapt_raise_streak = 0;
+        } else {
+            adapt_raise_streak = 0;
+            adapt_lower_streak = 0;
+        }
+        if (adapt_raise_streak >= 2 && adaptive_block_age < 2048) {
             adaptive_block_age *= 2;
-        } else if (demand_delta * 8 <= reclaimed_delta && adaptive_block_age > 256) {
+            adapt_raise_streak = 0;
+        } else if (adapt_lower_streak >= 2 && adaptive_block_age > 256) {
             adaptive_block_age /= 2;
+            adapt_lower_streak = 0;
         }
         if (adaptive_block_age != previous_age) {
             LOG_INFO(Render_Vulkan,
@@ -1466,7 +1523,7 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
         std::vector<vk::SparseMemoryBind> unbinds;
         boost::container::small_vector<VmaAllocation, 16> freed;
         const u64 reclaimed = buffer.ReclaimColdSparseBlocks(
-            cutoff, sweep_cap,
+            cutoff, gc_tick, sweep_cap,
             [&](u64 offset, u64 block_size) {
                 const VAddr addr = buffer.CpuAddr() + offset;
                 return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
@@ -1475,6 +1532,11 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
             },
             [&](u64 offset, u64 block_size, VmaAllocation allocation) {
                 const VAddr addr = buffer.CpuAddr() + offset;
+                // Metadata ghost per 64 KiB page: a later demand bind of this range reveals the
+                // true re-reference distance and pins the rebound blocks accordingly.
+                for (VAddr page = addr; page < addr + block_size; page += SPARSE_ALIGNMENT) {
+                    reclaim_ghosts[page >> 16] = gc_tick;
+                }
                 // Guest memory becomes the sole copy: any later use must re-upload.
                 memory_tracker->MarkRegionAsCpuModified(addr, block_size);
                 // Null the BDA entries so direct-memory shaders take the fault path, which
@@ -1505,6 +1567,14 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
         stats.block_reclaimed_bytes += reclaimed;
         sweep_cap -= std::min(sweep_cap, reclaimed);
     });
+    if (reclaim_ghosts.size() > 131072) {
+        // Entries this old are dead history (nothing re-references them); drop them so the map
+        // stays a bounded metadata cache rather than a leak.
+        const u64 expiry = gc_tick > 8192 ? gc_tick - 8192 : 0;
+        for (auto it = reclaim_ghosts.begin(); it != reclaim_ghosts.end();) {
+            it = it->second < expiry ? reclaim_ghosts.erase(it) : std::next(it);
+        }
+    }
 }
 
 void BufferCache::AdvanceGcEpoch() {
@@ -1645,6 +1715,7 @@ BufferCache::Statistics BufferCache::GetStatistics() {
     Statistics snapshot = stats;
     snapshot.sparse = sparse_buffers;
     snapshot.block_reclaim_age = adaptive_block_age;
+    snapshot.ghost_live = reclaim_ghosts.size();
     snapshot.live_buffers = 0;
     snapshot.bound_bytes = 0;
     lru_cache.ForEachItemBelow(std::numeric_limits<u64>::max(), [&](BufferId id) {
