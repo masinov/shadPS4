@@ -786,10 +786,11 @@ void Rasterizer::OnSubmit() {
             LOG_INFO(Render_Vulkan,
                      "Eviction readback: nominated={}, applied={}, aborted_dirty={}, "
                      "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}, "
-                     "converted_aliases={}",
+                     "converted_aliases={}, aborted_record_state={}, aborted_no_staging={}",
                      readback_stats.nominated, readback_stats.applied, readback_stats.aborted_dirty,
                      readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
-                     readback_stats.aborted_image_alias, readback_stats.converted_aliases);
+                     readback_stats.aborted_image_alias, readback_stats.converted_aliases,
+                     readback_stats.aborted_record_state, readback_stats.aborted_no_staging);
             LOG_INFO(Render_Vulkan,
                      "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
                      "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "

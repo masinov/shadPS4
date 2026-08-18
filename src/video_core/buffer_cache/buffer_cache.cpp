@@ -932,9 +932,29 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     // allocation-driven collection in the same command buffer.
     MarkBufferUsed(new_buffer);
     std::vector<vk::SparseMemoryBind> sparse_binds;
+    VAddr first_overlap_base = 0;
+    u64 first_overlap_size = 0;
+    if (!overlap.ids.empty()) {
+        const Buffer& first_overlap = slot_buffers[overlap.ids[0]];
+        first_overlap_base = first_overlap.CpuAddr();
+        first_overlap_size = first_overlap.SizeBytes();
+    }
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, sparse_binds);
     }
+    // Every replacement, unsampled: grow rewrites buffer backing under live guest ranges more
+    // often than any other operation (2,779 times in Run 39) and has never been individually
+    // observable. ~4 compact lines per second; the Run 25 flood was an order of magnitude denser.
+    LOG_INFO(Render_Vulkan,
+             "Buffer replace: reason={}, req=[{:#x},{:#x}), old=[{:#x},{:#x}), new=[{:#x},{:#x}), "
+             "overlaps={}, gpu_mod={}, leap={}",
+             overlap.ids.empty()       ? "new"
+             : overlap.ids.size() == 1 ? "grow"
+                                       : "bridge",
+             requested_addr, requested_addr + requested_size, first_overlap_base,
+             first_overlap_base + first_overlap_size, overlap.begin, overlap.end,
+             overlap.ids.size(), gpu_modified_ranges.Intersects(overlap.begin, size),
+             overlap.has_stream_leap);
     if (sparse_buffers) {
         // Inherited blocks cover the absorbed buffers; the pages of the request itself may still be
         // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the

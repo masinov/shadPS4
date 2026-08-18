@@ -152,6 +152,7 @@ void TextureCache::RecordEvictionReadbacks() {
         if (False(image.flags & ImageFlagBits::Registered) ||
             False(image.flags & ImageFlagBits::GpuModified) || image.binding.is_bound ||
             image.binding.is_target) {
+            ++readback_stats.aborted_record_state;
             clear_flag();
             continue;
         }
@@ -184,12 +185,14 @@ void TextureCache::RecordEvictionReadbacks() {
             copy_size += mip_size;
         }
         if (copy_size == 0) {
+            ++readback_stats.aborted_record_state;
             clear_flag();
             continue;
         }
         // Never wait for staging space here; a full ring simply retries on a later pass.
         const auto [mapping_data, mapping_offset] = download_buffer.Map(copy_size, 1, false);
         if (!mapping_data) {
+            ++readback_stats.aborted_no_staging;
             clear_flag();
             continue;
         }
@@ -1242,6 +1245,11 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
                 False(image.flags & ImageFlagBits::EvictionReadback) &&
                 False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&
+                // Color aspect only. Depth-stencil readback strips the stencil plane from the
+                // copies, so the written-back stencil bytes would be the scratch fill instead of
+                // guest-layout content, and the depth tiling round trip is unverified. Run 39
+                // spent 11 of 64 applications on depth targets for no reclaim benefit.
+                image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
                 image.AllocationSizeBytes() >= 2_MB && eviction_readbacks.size() < 8 &&
                 !buffer_cache.IsRegionGpuModified(image.info.guest_address,
                                                   image.info.guest_size) &&
@@ -1249,6 +1257,9 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
                 image.flags |= ImageFlagBits::EvictionReadback;
                 eviction_readbacks.push_back(image_id);
                 ++readback_stats.nominated;
+            }
+            if (result.skipped_gpu_modified < 3) {
+                skipped_gpu_modified_samples[result.skipped_gpu_modified] = image_id;
             }
             ++result.skipped_gpu_modified;
             return false;
@@ -1262,6 +1273,26 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
     };
 
     lru_cache.ForEachItemBelow(cutoff, collect);
+    if (result.skipped_gpu_modified > 0) {
+        // Identity samples settle whether the persistently skipped GPU-modified population is the
+        // same stuck set every pass or a rotating fresh one (Run 39 open question). Three per
+        // pass at GC-pass frequency is a negligible log cost.
+        for (u32 i = 0; i < 3 && i < result.skipped_gpu_modified; ++i) {
+            const ImageId sample_id = skipped_gpu_modified_samples[i];
+            if (!sample_id) {
+                continue;
+            }
+            const Image& sample = slot_images[sample_id];
+            LOG_INFO(Render_Vulkan,
+                     "GC gpu-modified skip sample: image={}, addr={:#x}, size={:#x}, format={}, "
+                     "readback_flag={}, dirty={}",
+                     sample_id.index, sample.info.guest_address, sample.info.guest_size,
+                     vk::to_string(sample.info.pixel_format),
+                     True(sample.flags & ImageFlagBits::EvictionReadback),
+                     True(sample.flags & ImageFlagBits::Dirty));
+        }
+        skipped_gpu_modified_samples.fill(ImageId{});
+    }
     if (budget.pressure == GcPressure::Critical) {
         std::stable_sort(
             candidates.begin(), candidates.end(),

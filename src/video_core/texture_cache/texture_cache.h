@@ -367,6 +367,7 @@ private:
     std::unordered_set<ImageId> download_images;
     u64 gc_tick = 0;
     std::vector<ImageId> eviction_readbacks;
+    std::array<ImageId, 3> skipped_gpu_modified_samples{};
 
 public:
     struct ReadbackStats {
@@ -377,6 +378,8 @@ public:
         u64 aborted_buffer_alias{};
         u64 aborted_image_alias{};
         u64 converted_aliases{};
+        u64 aborted_record_state{};
+        u64 aborted_no_staging{};
     };
 
     [[nodiscard]] ReadbackStats GetReadbackStats() const noexcept {
