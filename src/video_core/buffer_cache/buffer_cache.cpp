@@ -1525,10 +1525,16 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
         adapt_reclaimed_snapshot = stats.block_reclaimed_bytes;
         adapt_demand_snapshot = stats.demand_bound_bytes;
     }
-    const u64 min_age =
-        (budget.pressure == GcPressure::Critical || budget.overshoot)
-            ? std::max<u64>(SparseBlockReclaimMinAge(budget.pressure, true), adaptive_block_age / 4)
-            : adaptive_block_age;
+    // The pressure tiers are constant floors, deliberately NOT scaled by the adaptive age:
+    // Run 47's OOM traced to exactly that coupling - the controller sat at 2048, making the
+    // critical tier max(96, 512) = 512 epochs, so when the allocator failed a 56 MiB bind the
+    // emergency sweep found an empty pool (usage 6037 -> 6037 on a 6144 card) while the grace
+    // period and pins retained everything else. A high adaptive age is a statement about churn
+    // economics in normal operation; an emergency is not normal operation.
+    const u64 min_age = budget.emergency ? 32
+                        : (budget.pressure == GcPressure::Critical || budget.overshoot)
+                            ? SparseBlockReclaimMinAge(budget.pressure, true)
+                            : adaptive_block_age;
     if (gc_tick <= min_age) {
         return;
     }
@@ -1538,8 +1544,9 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
     // valid state), and the unbind itself is deferred to the next submission, where it waits for
     // this batch's completion on the master timeline. Run 45's corruption came from the inverse
     // order: the unbind executed before the batch whose draws still read the entries.
-    const bool pressure_override = budget.pressure == GcPressure::Critical || budget.overshoot;
-    const u64 limbo_grace = LimboGraceEpochs(budget.pressure, budget.overshoot);
+    const bool pressure_override =
+        budget.emergency || budget.pressure == GcPressure::Critical || budget.overshoot;
+    const u64 limbo_grace = LimboGraceEpochs(budget.pressure, budget.overshoot, budget.emergency);
     const u64 limbo_expiry = gc_tick > limbo_grace ? gc_tick - limbo_grace : 0;
     ForEachBufferInRange(0, std::numeric_limits<VAddr>::max(), [&](BufferId id, Buffer& buffer) {
         if (!buffer.IsSparse() || buffer.is_deleted) {

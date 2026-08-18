@@ -142,7 +142,12 @@ constexpr u32 GcMaxCheapScans = 16384;
 /// revisits against 0.5 GiB of in-limbo reinstatements at a 32-epoch grace: most of the revisit
 /// mass sits above 32, so the normal tier now covers the histogram's dominant band, and only
 /// genuine pressure shortens the stay.
-[[nodiscard]] constexpr u64 LimboGraceEpochs(GcPressure pressure, bool overshoot) noexcept {
+[[nodiscard]] constexpr u64 LimboGraceEpochs(GcPressure pressure, bool overshoot,
+                                             bool emergency = false) noexcept {
+    if (emergency) {
+        // An allocation just failed: everything already condemned releases immediately.
+        return 0;
+    }
     if (pressure == GcPressure::Critical || overshoot) {
         return 32;
     }
