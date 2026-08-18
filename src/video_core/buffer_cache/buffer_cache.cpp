@@ -7,6 +7,7 @@
 #include <numeric>
 #include <vector>
 #include "common/alignment.h"
+#include "common/config.h"
 #include "common/debug.h"
 #include "common/memory_patcher.h"
 #include "common/scope_exit.h"
@@ -19,6 +20,8 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+#include <vk_mem_alloc.h>
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
@@ -959,7 +962,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
         // Inherited blocks cover the absorbed buffers; the pages of the request itself may still be
         // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the
         // request stay unbound until they are first touched.
-        new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size,
+        new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size, gc_tick,
                                allocation_failure_callback, sparse_binds);
         scheduler.BindSparse(new_buffer.Handle(), sparse_binds);
         if (!overlap.ids.empty()) {
@@ -1100,6 +1103,9 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
         return;
     }
     const u64 offset = buffer.Offset(device_addr);
+    // Every synchronized access stamps the covered blocks' GC epoch; the cold-block sweep only
+    // unbinds blocks whose stamp is hundreds of epochs old.
+    buffer.TouchSparseRange(offset, size, gc_tick);
     if (buffer.IsRangeBound(offset, size)) {
         return;
     }
@@ -1111,7 +1117,8 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
         allocation_failure_callback = [this, size] { ReclaimForAllocation(size, true, false); };
     }
     std::vector<vk::SparseMemoryBind> sparse_binds;
-    const u64 bound = buffer.EnsureBound(offset, size, allocation_failure_callback, sparse_binds);
+    const u64 bound =
+        buffer.EnsureBound(offset, size, gc_tick, allocation_failure_callback, sparse_binds);
     if (sparse_binds.empty()) {
         return;
     }
@@ -1414,6 +1421,69 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
     });
 }
 
+void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
+    // Whole-buffer eviction cannot reach a merged streaming span that is partially warm: any
+    // touch anywhere keeps the buffer's LRU entry fresh while most of its 64 KiB blocks go cold
+    // (Run 42: 2.2 GiB bound against a 1.7 GiB unmet reclaim target). Blocks whose last
+    // synchronized access is hundreds of epochs old are dropped: their ranges hold no
+    // GPU-authored data, so guest memory is authoritative and a later touch simply demand-binds
+    // and re-uploads. The unbind travels the batched BindSparse path, so previously submitted
+    // work still reads the old binding; the allocation itself is freed only after the tick that
+    // carries the unbind completes.
+    const u64 min_age = SparseBlockReclaimMinAge(budget.pressure, budget.overshoot);
+    if (gc_tick <= min_age) {
+        return;
+    }
+    const u64 cutoff = gc_tick - min_age;
+    u64 sweep_cap = std::min<u64>(budget.bytes_remaining, 512_MB);
+    ForEachBufferInRange(0, std::numeric_limits<VAddr>::max(), [&](BufferId id, Buffer& buffer) {
+        if (sweep_cap == 0 || !buffer.IsSparse() || buffer.is_deleted) {
+            return;
+        }
+        std::vector<vk::SparseMemoryBind> unbinds;
+        boost::container::small_vector<VmaAllocation, 16> freed;
+        const u64 reclaimed = buffer.ReclaimColdSparseBlocks(
+            cutoff, sweep_cap,
+            [&](u64 offset, u64 block_size) {
+                const VAddr addr = buffer.CpuAddr() + offset;
+                return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
+                       !preemptive_downloads.Intersects(addr, block_size) &&
+                       !IsRegionGpuModified(addr, block_size);
+            },
+            [&](u64 offset, u64 block_size, VmaAllocation allocation) {
+                const VAddr addr = buffer.CpuAddr() + offset;
+                // Guest memory becomes the sole copy: any later use must re-upload.
+                memory_tracker->MarkRegionAsCpuModified(addr, block_size);
+                // Null the BDA entries so direct-memory shaders take the fault path, which
+                // rebinds and synchronizes the pages.
+                const u64 page_begin = addr >> CACHING_PAGEBITS;
+                const u64 page_end = Common::DivCeil(addr + block_size, CACHING_PAGESIZE);
+                const u64 pt_offset =
+                    bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
+                bda_pagetable_buffer.Fill(pt_offset,
+                                          (page_end - page_begin) * sizeof(vk::DeviceAddress), 0);
+                freed.push_back(allocation);
+            },
+            unbinds);
+        if (unbinds.empty()) {
+            return;
+        }
+        scheduler.BindSparse(buffer.Handle(), unbinds);
+        scheduler.DeferOperation(
+            [allocator = instance.GetAllocator(),
+             allocations = std::vector<VmaAllocation>(freed.begin(), freed.end())] {
+                for (VmaAllocation allocation : allocations) {
+                    vmaFreeMemory(allocator, allocation);
+                }
+            });
+        budget.Reclaim(reclaimed);
+        result.reclaimed_bytes += reclaimed;
+        stats.block_reclaims += unbinds.size();
+        stats.block_reclaimed_bytes += reclaimed;
+        sweep_cap -= std::min(sweep_cap, reclaimed);
+    });
+}
+
 void BufferCache::AdvanceGcEpoch() {
     ++gc_tick;
 }
@@ -1541,6 +1611,9 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
         budget.Reclaim(candidate.size);
         result.reclaimed_bytes += candidate.size;
         ++result.evicted_objects;
+    }
+    if (sparse_buffers && budget.Active() && Config::getUseSparseBlockReclaim()) {
+        SweepColdSparseBlocks(budget, result);
     }
     return result;
 }

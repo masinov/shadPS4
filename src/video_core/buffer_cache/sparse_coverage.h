@@ -37,6 +37,41 @@ public:
         ranges.insert(it, Range{merged_begin, merged_end - merged_begin});
     }
 
+    /// Removes [offset, offset + size) from the covered set, splitting ranges as needed.
+    void Subtract(u64 offset, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        const u64 end = offset + size;
+        auto it =
+            std::ranges::upper_bound(ranges, offset, {}, [](const Range& r) { return r.first; });
+        if (it != ranges.begin()) {
+            --it;
+        }
+        while (it != ranges.end() && it->first < end) {
+            const u64 r_begin = it->first;
+            const u64 r_end = it->first + it->second;
+            if (r_end <= offset) {
+                ++it;
+                continue;
+            }
+            if (r_begin < offset && r_end > end) {
+                it->second = offset - r_begin;
+                it = ranges.insert(it + 1, Range{end, r_end - end});
+                ++it;
+            } else if (r_begin < offset) {
+                it->second = offset - r_begin;
+                ++it;
+            } else if (r_end > end) {
+                it->first = end;
+                it->second = r_end - end;
+                ++it;
+            } else {
+                it = ranges.erase(it);
+            }
+        }
+    }
+
     /// True when [offset, offset + size) lies entirely inside one range.
     [[nodiscard]] bool Contains(u64 offset, u64 size) const noexcept {
         if (size == 0) {

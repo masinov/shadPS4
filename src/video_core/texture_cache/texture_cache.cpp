@@ -6,6 +6,7 @@
 #include <limits>
 #include <vector>
 
+#include <boost/container/static_vector.hpp>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -1205,6 +1206,7 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
     u64 candidate_bytes{};
 
     u32 cheap_scans_remaining = GcMaxCheapScans;
+    boost::container::static_vector<u32, 64> skipped_unique;
     const auto collect = [&](ImageId image_id) {
         if (inspections_remaining == 0 || cheap_scans_remaining == 0 ||
             (budget.pressure != GcPressure::Critical &&
@@ -1271,6 +1273,10 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             if (result.skipped_gpu_modified < 3) {
                 skipped_gpu_modified_samples[result.skipped_gpu_modified] = image_id;
             }
+            if (std::ranges::find(skipped_unique, image_id.index) == skipped_unique.end() &&
+                skipped_unique.size() < skipped_unique.static_capacity) {
+                skipped_unique.push_back(image_id.index);
+            }
             ++result.skipped_gpu_modified;
             return false;
         }
@@ -1283,6 +1289,7 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
     };
 
     lru_cache.ForEachItemBelow(cutoff, collect);
+    result.skipped_gpu_modified_unique = static_cast<u32>(skipped_unique.size());
     if (result.skipped_gpu_modified > 0) {
         // Identity samples settle whether the persistently skipped GPU-modified population is the
         // same stuck set every pass or a rotating fresh one (Run 39 open question). Three per
@@ -1292,14 +1299,20 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             if (!sample_id) {
                 continue;
             }
-            const Image& sample = slot_images[sample_id];
-            LOG_INFO(Render_Vulkan,
-                     "GC gpu-modified skip sample: image={}, addr={:#x}, size={:#x}, format={}, "
-                     "readback_flag={}, dirty={}",
-                     sample_id.index, sample.info.guest_address, sample.info.guest_size,
-                     vk::to_string(sample.info.pixel_format),
-                     True(sample.flags & ImageFlagBits::EvictionReadback),
-                     True(sample.flags & ImageFlagBits::Dirty));
+            Image& sample = slot_images[sample_id];
+            // Run 42 left three clean color images unexplained in this set: print which
+            // nomination condition holds each sample back.
+            LOG_INFO(
+                Render_Vulkan,
+                "GC gpu-modified skip sample: image={}, addr={:#x}, size={:#x}, format={}, "
+                "readback_flag={}, dirty={}, color={}, buffer_alias={}, viable={}",
+                sample_id.index, sample.info.guest_address, sample.info.guest_size,
+                vk::to_string(sample.info.pixel_format),
+                True(sample.flags & ImageFlagBits::EvictionReadback),
+                True(sample.flags & ImageFlagBits::Dirty),
+                sample.aspect_mask == vk::ImageAspectFlagBits::eColor,
+                buffer_cache.IsRegionGpuModified(sample.info.guest_address, sample.info.guest_size),
+                IsReadbackViable(sample_id, sample));
         }
         skipped_gpu_modified_samples.fill(ImageId{});
     }

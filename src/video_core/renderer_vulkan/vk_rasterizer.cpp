@@ -762,11 +762,12 @@ void Rasterizer::OnSubmit() {
             gc_log_count = 0;
             LOG_INFO(Render_Vulkan,
                      "VRAM GC pass: inspected={}, evicted={} ({} MiB estimated), "
-                     "skipped_gpu_modified={}, skipped_bound={}, skipped_in_flight={}, "
-                     "skipped_unallocated={}, skipped_small={}, remaining_target={} MiB, "
-                     "elapsed={} ms",
+                     "skipped_gpu_modified={} (unique={}), skipped_bound={}, "
+                     "skipped_in_flight={}, skipped_unallocated={}, skipped_small={}, "
+                     "remaining_target={} MiB, elapsed={} ms",
                      inspected, evicted, reclaimed / 1_MB, skipped_modified,
-                     texture_result.skipped_bound, skipped_in_flight, skipped_unallocated,
+                     texture_result.skipped_gpu_modified_unique, texture_result.skipped_bound,
+                     skipped_in_flight, skipped_unallocated,
                      texture_result.skipped_small + buffer_result.skipped_small,
                      gc_budget.bytes_remaining / 1_MB, gc_elapsed);
         } else if (pressure_changed && gc_budget.pressure == VideoCore::GcPressure::None) {
@@ -794,13 +795,15 @@ void Rasterizer::OnSubmit() {
             LOG_INFO(Render_Vulkan,
                      "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
                      "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "
-                     "sparse_binds={} ({} ms total, max {} ms), usage={} MiB",
+                     "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB), "
+                     "usage={} MiB",
                      cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB,
                      cache_stats.replacements, cache_stats.replacements_new,
                      cache_stats.replacements_grow, cache_stats.replacements_bridge,
                      cache_stats.replaced_bytes / 1_MB, cache_stats.sparse,
                      cache_stats.demand_bindings, cache_stats.demand_bound_bytes / 1_MB,
                      sparse_stats.count, sparse_stats.total_ms, sparse_stats.max_ms,
+                     cache_stats.block_reclaims, cache_stats.block_reclaimed_bytes / 1_MB,
                      used_memory / 1_MB);
         }
     }

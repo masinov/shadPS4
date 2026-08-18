@@ -129,7 +129,7 @@ bool UniqueBuffer::IsRangeBound(VkDeviceSize offset, VkDeviceSize size) const no
     return end <= offset || sparse_coverage.Contains(offset, end - offset);
 }
 
-u64 UniqueBuffer::BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage,
+u64 UniqueBuffer::BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage, u64 epoch,
                             const std::function<void()>& allocation_failure_callback,
                             std::vector<vk::SparseMemoryBind>& out_binds) {
     ASSERT(is_sparse);
@@ -204,6 +204,7 @@ u64 UniqueBuffer::BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage 
             .buffer_offset = gap_begin,
             .size = gap_size,
             .owned = true,
+            .last_use_epoch = epoch,
         };
         const auto insert_at =
             std::ranges::upper_bound(sparse_blocks, gap_begin, {}, &SparseBlock::buffer_offset);

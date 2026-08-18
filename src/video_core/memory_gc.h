@@ -46,6 +46,7 @@ struct GcResult {
     u32 inspected_objects{};
     u32 evicted_objects{};
     u32 skipped_gpu_modified{};
+    u32 skipped_gpu_modified_unique{};
     u32 skipped_bound{};
     u32 skipped_in_flight{};
     u32 skipped_pending{};
@@ -130,6 +131,18 @@ constexpr u64 GcMinimumAutomaticEvictionBytes = 2_MB;
 // reaching the large ones behind them (Run 30: ~2,600 of ~2,640 inspections were small-skips and
 // no texture was evicted all session). The cheap-scan cap only bounds worst-case list walking.
 constexpr u32 GcMaxCheapScans = 16384;
+
+/// Minimum age, in GC epochs, of a sparse block's last synchronized access before the collector
+/// may unbind it. Conservative: BDA direct-memory accesses do not stamp epochs, so the age must
+/// comfortably exceed any realistic re-reference distance; a wrong drop self-heals through the
+/// fault path but costs a transient zero read.
+[[nodiscard]] constexpr u64 SparseBlockReclaimMinAge(GcPressure pressure,
+                                                     bool overshoot = false) noexcept {
+    if (pressure == GcPressure::Critical || overshoot) {
+        return 96;
+    }
+    return 256;
+}
 
 // Keep enough room for the allocation itself plus a small amount of driver bookkeeping. The
 // driver's heap budget can move between queries, so targeting its exact edge still races other

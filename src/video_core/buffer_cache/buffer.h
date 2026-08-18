@@ -58,6 +58,7 @@ struct SparseBlock {
     VkDeviceSize buffer_offset{};
     VkDeviceSize size{};
     bool owned{};
+    u64 last_use_epoch{}; ///< GC epoch of the last synchronized access covering this block
 };
 
 struct UniqueBuffer {
@@ -118,7 +119,7 @@ struct UniqueBuffer {
     /// Allocates and records bindings for every part of [offset, offset + size) that has no
     /// memory yet. Appends the Vulkan bind operations to out_binds (the caller submits them) and
     /// returns the number of bytes newly bound.
-    u64 BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage,
+    u64 BindRange(VkDeviceSize offset, VkDeviceSize size, MemoryUsage usage, u64 epoch,
                   const std::function<void()>& allocation_failure_callback,
                   std::vector<vk::SparseMemoryBind>& out_binds);
 
@@ -129,6 +130,48 @@ struct UniqueBuffer {
                         std::vector<vk::SparseMemoryBind>& out_binds);
 
     [[nodiscard]] bool IsRangeBound(VkDeviceSize offset, VkDeviceSize size) const noexcept;
+
+    /// Stamps the GC epoch on every block overlapping [offset, offset + size).
+    void TouchRange(VkDeviceSize offset, VkDeviceSize size, u64 epoch) noexcept {
+        auto it = std::ranges::upper_bound(sparse_blocks, offset, {}, &SparseBlock::buffer_offset);
+        if (it != sparse_blocks.begin()) {
+            --it;
+        }
+        const VkDeviceSize end = offset + size;
+        for (; it != sparse_blocks.end() && it->buffer_offset < end; ++it) {
+            if (it->buffer_offset + it->size > offset) {
+                it->last_use_epoch = epoch;
+            }
+        }
+    }
+
+    /// Unbinds owned blocks whose last touch predates cutoff_epoch and that can_drop approves,
+    /// up to max_bytes. Appends null-memory bind operations (the caller submits them) and hands
+    /// each dropped block's allocation to on_drop for deferred release. Returns bytes unbound.
+    template <typename CanDrop, typename OnDrop>
+    u64 ReclaimColdBlocks(u64 cutoff_epoch, u64 max_bytes, CanDrop&& can_drop, OnDrop&& on_drop,
+                          std::vector<vk::SparseMemoryBind>& out_binds) {
+        u64 reclaimed = 0;
+        for (auto it = sparse_blocks.begin(); it != sparse_blocks.end() && reclaimed < max_bytes;) {
+            if (it->last_use_epoch >= cutoff_epoch || !it->owned ||
+                !can_drop(it->buffer_offset, it->size)) {
+                ++it;
+                continue;
+            }
+            out_binds.push_back(vk::SparseMemoryBind{
+                .resourceOffset = it->buffer_offset,
+                .size = it->size,
+                .memory = VK_NULL_HANDLE,
+                .memoryOffset = 0,
+            });
+            sparse_coverage.Subtract(it->buffer_offset, it->size);
+            sparse_bound_bytes -= it->size;
+            reclaimed += it->size;
+            on_drop(it->buffer_offset, it->size, it->allocation);
+            it = sparse_blocks.erase(it);
+        }
+        return reclaimed;
+    }
 
     /// Calls func(offset, size) for each maximal contiguous bound range (adjacent blocks merged).
     template <typename Func>
@@ -171,12 +214,31 @@ public:
 
     /// Sparse buffers only. Binds memory for [offset, offset + size) where missing; the bind
     /// operations are appended to out_binds for the caller to submit. Returns bytes newly bound.
-    u64 EnsureBound(u64 offset, u64 size, const std::function<void()>& allocation_failure_callback,
+    u64 EnsureBound(u64 offset, u64 size, u64 epoch,
+                    const std::function<void()>& allocation_failure_callback,
                     std::vector<vk::SparseMemoryBind>& out_binds) {
         const u64 bound =
-            buffer.BindRange(offset, size, usage, allocation_failure_callback, out_binds);
+            buffer.BindRange(offset, size, usage, epoch, allocation_failure_callback, out_binds);
         allocation_size = buffer.sparse_bound_bytes;
         return bound;
+    }
+
+    /// Sparse buffers only: records that [offset, offset + size) was accessed this GC epoch.
+    void TouchSparseRange(u64 offset, u64 size, u64 epoch) noexcept {
+        if (buffer.is_sparse) {
+            buffer.TouchRange(offset, size, epoch);
+        }
+    }
+
+    /// Sparse buffers only. See UniqueBuffer::ReclaimColdBlocks.
+    template <typename CanDrop, typename OnDrop>
+    u64 ReclaimColdSparseBlocks(u64 cutoff_epoch, u64 max_bytes, CanDrop&& can_drop,
+                                OnDrop&& on_drop, std::vector<vk::SparseMemoryBind>& out_binds) {
+        const u64 reclaimed =
+            buffer.ReclaimColdBlocks(cutoff_epoch, max_bytes, std::forward<CanDrop>(can_drop),
+                                     std::forward<OnDrop>(on_drop), out_binds);
+        allocation_size = buffer.sparse_bound_bytes;
+        return reclaimed;
     }
 
     /// Sparse buffers only. Inherits every memory block of `other` (a buffer this one replaces)

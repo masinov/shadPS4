@@ -240,6 +240,10 @@ public:
     /// Reclaims CPU-authoritative buffers without waiting for GPU readbacks.
     [[nodiscard]] GcResult RunGarbageCollector(GcBudget& budget);
 
+    /// Unbinds cold, CPU-authoritative 64 KiB blocks of live sparse buffers. Called by the
+    /// garbage collector when whole-buffer eviction leaves the budget unmet.
+    void SweepColdSparseBlocks(GcBudget& budget, GcResult& result);
+
     /// Installs the rasterizer-owned shared collector used by pressured allocations.
     void SetAllocationReclaimCallback(std::function<void(u64, u64, bool, bool)> callback) {
         allocation_reclaim_callback = std::move(callback);
@@ -257,7 +261,9 @@ public:
         u64 demand_bindings{};     ///< sparse: EnsureRangeBound calls that bound something
         u64 demand_bound_bytes{};
         u64 live_buffers{};
-        u64 bound_bytes{}; ///< sum of AllocationSizeBytes over live buffers
+        u64 bound_bytes{};    ///< sum of AllocationSizeBytes over live buffers
+        u64 block_reclaims{}; ///< sparse: cold blocks unbound by the GC sweep
+        u64 block_reclaimed_bytes{};
         bool sparse{};
     };
 
