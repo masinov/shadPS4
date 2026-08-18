@@ -967,6 +967,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
                                         [&](u64 block_offset, u64 block_size, u64 limbo_epoch) {
                                             ++stats.reinstatements;
                                             stats.reinstated_bytes += block_size;
+                                            WriteBdaEntries(new_buffer, block_offset, block_size);
                                         });
         new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size, gc_tick,
                                allocation_failure_callback, sparse_binds);
@@ -1163,6 +1164,9 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
             const u64 distance = gc_tick - limbo_epoch;
             buffer.ProtectSparseRange(block_offset, block_size,
                                       gc_tick + std::clamp<u64>(2 * distance, 512, 8192));
+            // Inherited limbo blocks lost their BDA entries when the absorbed buffer was
+            // unregistered; rewrite unconditionally (idempotent for same-buffer blocks).
+            WriteBdaEntries(buffer, block_offset, block_size);
         });
     if (buffer.IsRangeBound(offset, size)) {
         return;
@@ -1586,6 +1590,7 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
             [&](u64 offset, u64 block_size) {
                 ++stats.limbo_rescued;
                 stats.limbo_rescued_bytes += block_size;
+                WriteBdaEntries(buffer, offset, block_size);
             },
             unbinds, freed);
         if (unbinds.empty()) {

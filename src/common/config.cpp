@@ -251,7 +251,7 @@ static ConfigEntry<int> extraDmemInMbytes(0);
 static ConfigEntry<bool> useHostMemoryFallback(false);
 static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
-static ConfigEntry<bool> useSparseBlockReclaim(true);
+static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<int> memoryCompressionLevel(0);
 static ConfigEntry<int> usbDeviceBackend(UsbBackendType::Real);
 static ConfigEntry<s32> cameraId(-1);
@@ -2806,7 +2806,7 @@ void setDefaultValues() {
     useHostMemoryFallback = false;
     useSparseCacheBuffers = false;
     useEvictionReadback = true;
-    useSparseBlockReclaim = true;
+    useSparseBlockReclaim = false;
     memoryCompressionLevel = 0;
     extraDmemInMbytes = 0;
 
