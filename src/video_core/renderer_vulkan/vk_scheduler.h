@@ -466,6 +466,14 @@ public:
     /// on; batching them into the flush avoids a separate queue-mutex acquisition per bind.
     void BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds);
 
+    /// Queues null-memory unbind operations that must not execute until every batch submitted up
+    /// to and including the one currently being recorded has completed. They are flushed at the
+    /// NEXT submission, waiting on this batch's timeline value, and ordered before that
+    /// submission's regular sparse binds so a re-bind of the same range always wins. on_complete
+    /// (e.g. freeing the backing memory) runs once the unbind is guaranteed executed.
+    void QueueDeferredSparseUnbind(vk::Buffer buffer, std::span<const vk::SparseMemoryBind> binds,
+                                   std::function<void()> on_complete);
+
     struct SparseBindStatistics {
         u64 count{};
         u64 total_ms{};
@@ -550,6 +558,14 @@ private:
         std::vector<vk::SparseMemoryBind> binds;
     };
     std::vector<PendingSparseBind> pending_sparse_binds;
+    struct DeferredSparseUnbind {
+        vk::Buffer buffer;
+        std::vector<vk::SparseMemoryBind> binds;
+        std::function<void()> on_complete;
+        u64 wait_tick{}; ///< Master-timeline value the unbind must wait for (set when armed)
+    };
+    std::vector<DeferredSparseUnbind> staged_sparse_unbinds; ///< Queued during this recording
+    std::vector<DeferredSparseUnbind> armed_sparse_unbinds;  ///< Flush at the next submission
     SparseBindStatistics sparse_bind_stats{};
 };
 

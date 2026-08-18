@@ -76,6 +76,13 @@ void UniqueBuffer::Destroy() noexcept {
             device.destroyBuffer(buffer);
         }
         // Blocks that were handed to a successor (aliased) are freed by that successor.
+        for (const SparseBlock& block : limbo_blocks) {
+            if (block.owned) {
+                vmaFreeMemory(allocator, block.allocation);
+            }
+        }
+        limbo_blocks.clear();
+        limbo_bytes = 0;
         for (const SparseBlock& block : sparse_blocks) {
             if (block.owned && block.allocation) {
                 vmaFreeMemory(allocator, block.allocation);
@@ -247,6 +254,30 @@ void UniqueBuffer::TakeOverBlocks(UniqueBuffer& other, s64 delta,
             .memoryOffset = taken.memory_offset,
         });
     }
+    // Limbo (victim-stage) blocks move too, keeping their grace-period age. Their memory is
+    // aliased into the successor at the matching guest address exactly like active blocks -
+    // otherwise a later reinstatement would restore coverage over a range this buffer never
+    // bound. Coverage stays withheld, so the range still routes through reinstatement.
+    for (SparseBlock& block : other.limbo_blocks) {
+        const s64 new_offset = static_cast<s64>(block.buffer_offset) + delta;
+        ASSERT_MSG(new_offset >= 0 &&
+                       static_cast<VkDeviceSize>(new_offset) + block.size <= sparse_size,
+                   "Limbo block [{:#x},{:#x}) does not fit the successor of size {:#x} (delta {})",
+                   block.buffer_offset, block.buffer_offset + block.size, sparse_size, delta);
+        SparseBlock taken = block;
+        taken.buffer_offset = static_cast<VkDeviceSize>(new_offset);
+        taken.owned = block.owned;
+        block.owned = false;
+        limbo_blocks.push_back(taken);
+        limbo_bytes += taken.size;
+        out_binds.push_back(vk::SparseMemoryBind{
+            .resourceOffset = taken.buffer_offset,
+            .size = taken.size,
+            .memory = taken.memory,
+            .memoryOffset = taken.memory_offset,
+        });
+    }
+    other.limbo_bytes = 0;
 }
 
 void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,

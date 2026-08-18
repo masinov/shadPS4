@@ -271,7 +271,10 @@ public:
         u64 block_reclaims{}; ///< sparse: cold blocks unbound by the GC sweep
         u64 block_reclaimed_bytes{};
         u64 block_reclaim_age{}; ///< sparse: current adaptive age threshold, in GC epochs
-        u64 ghost_hits{};        ///< sparse: demand binds that re-bound a reclaimed range
+        u64 reinstatements{};    ///< sparse: victim-stage blocks recalled for free
+        u64 reinstated_bytes{};
+        u64 limbo_bytes{}; ///< sparse: bytes currently in the victim stage (still resident)
+        u64 ghost_hits{};  ///< sparse: demand binds that re-bound a reclaimed range
         u64 ghost_hit_bytes{};
         u64 ghost_live{};                ///< sparse: ghost entries currently tracked
         std::array<u64, 6> ghost_dist{}; ///< re-reference distance histogram:

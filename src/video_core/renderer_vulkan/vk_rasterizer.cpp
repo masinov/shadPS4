@@ -807,10 +807,13 @@ void Rasterizer::OnSubmit() {
                 cache_stats.block_reclaimed_bytes / 1_MB, cache_stats.block_reclaim_age,
                 used_memory / 1_MB);
             LOG_INFO(Render_Vulkan,
-                     "Sparse reclaim ghosts: hits={} ({} MiB), live={}, distance histogram "
+                     "Sparse reclaim ghosts: hits={} ({} MiB), live={}, limbo={} MiB, "
+                     "reinstated={} ({} MiB), distance histogram "
                      "<256={} <512={} <1024={} <2048={} <4096={} >=4096={}",
                      cache_stats.ghost_hits, cache_stats.ghost_hit_bytes / 1_MB,
-                     cache_stats.ghost_live, cache_stats.ghost_dist[0], cache_stats.ghost_dist[1],
+                     cache_stats.ghost_live, cache_stats.limbo_bytes / 1_MB,
+                     cache_stats.reinstatements, cache_stats.reinstated_bytes / 1_MB,
+                     cache_stats.ghost_dist[0], cache_stats.ghost_dist[1],
                      cache_stats.ghost_dist[2], cache_stats.ghost_dist[3],
                      cache_stats.ghost_dist[4], cache_stats.ghost_dist[5]);
         }

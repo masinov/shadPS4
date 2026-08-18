@@ -60,6 +60,7 @@ struct SparseBlock {
     bool owned{};
     u64 last_use_epoch{};    ///< GC epoch of the last synchronized access covering this block
     u64 min_reclaim_epoch{}; ///< Ghost-hit protection: not reclaimable before this epoch
+    u64 limbo_epoch{};       ///< Epoch the block entered limbo (victim stage), 0 while bound
 };
 
 struct UniqueBuffer {
@@ -162,32 +163,86 @@ struct UniqueBuffer {
         }
     }
 
-    /// Unbinds owned blocks whose last touch predates cutoff_epoch and that can_drop approves,
-    /// up to max_bytes. Appends null-memory bind operations (the caller submits them) and hands
-    /// each dropped block's allocation to on_drop for deferred release. Returns bytes unbound.
-    template <typename CanDrop, typename OnDrop>
-    u64 ReclaimColdBlocks(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes, CanDrop&& can_drop,
-                          OnDrop&& on_drop, std::vector<vk::SparseMemoryBind>& out_binds) {
-        u64 reclaimed = 0;
-        for (auto it = sparse_blocks.begin(); it != sparse_blocks.end() && reclaimed < max_bytes;) {
+    /// Victim stage (limbo): a reclaimed block keeps its memory and Vulkan binding for a
+    /// grace period. Coverage is subtracted, so demand for the range flows through
+    /// ReinstateLimboRange, which restores the block for free - no bind operation, no re-upload,
+    /// and the BDA entries were never touched. Only blocks that survive limbo unreferenced are
+    /// actually unbound, and that unbind is deferred and ordered after the recording batch.
+    template <typename CanDrop>
+    u64 MoveColdBlocksToLimbo(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
+                              CanDrop&& can_drop) {
+        u64 moved = 0;
+        for (auto it = sparse_blocks.begin(); it != sparse_blocks.end() && moved < max_bytes;) {
             if (it->last_use_epoch >= cutoff_epoch || it->min_reclaim_epoch > current_epoch ||
                 !it->owned || !can_drop(it->buffer_offset, it->size)) {
                 ++it;
                 continue;
             }
-            out_binds.push_back(vk::SparseMemoryBind{
+            sparse_coverage.Subtract(it->buffer_offset, it->size);
+            sparse_bound_bytes -= it->size;
+            limbo_bytes += it->size;
+            moved += it->size;
+            it->limbo_epoch = current_epoch;
+            limbo_blocks.push_back(*it);
+            it = sparse_blocks.erase(it);
+        }
+        return moved;
+    }
+
+    /// Restores limbo blocks intersecting [offset, offset + size) to the bound set. Free: the
+    /// memory never left and the BDA entries were never cleared.
+    template <typename OnReinstate>
+    void ReinstateLimboRange(VkDeviceSize offset, VkDeviceSize size, u64 epoch,
+                             OnReinstate&& on_reinstate) {
+        if (limbo_blocks.empty()) {
+            return;
+        }
+        const VkDeviceSize end = offset + size;
+        for (auto it = limbo_blocks.begin(); it != limbo_blocks.end();) {
+            if (it->buffer_offset >= end || it->buffer_offset + it->size <= offset) {
+                ++it;
+                continue;
+            }
+            SparseBlock block = *it;
+            it = limbo_blocks.erase(it);
+            on_reinstate(block.buffer_offset, block.size, block.limbo_epoch);
+            block.last_use_epoch = epoch;
+            block.limbo_epoch = 0;
+            const auto insert_at = std::ranges::upper_bound(sparse_blocks, block.buffer_offset, {},
+                                                            &SparseBlock::buffer_offset);
+            sparse_blocks.insert(insert_at, block);
+            sparse_coverage.Add(block.buffer_offset, block.size);
+            sparse_bound_bytes += block.size;
+            limbo_bytes -= block.size;
+        }
+    }
+
+    /// Removes limbo blocks whose grace period ended, emitting the null-memory unbind operations
+    /// (the caller defers them behind the recording batch) and the allocations to free once the
+    /// unbind has executed. on_expired runs per block before removal.
+    template <typename OnExpired>
+    u64 CollectExpiredLimbo(u64 expiry_epoch, OnExpired&& on_expired,
+                            std::vector<vk::SparseMemoryBind>& out_unbinds,
+                            std::vector<VmaAllocation>& out_allocations) {
+        u64 released = 0;
+        for (auto it = limbo_blocks.begin(); it != limbo_blocks.end();) {
+            if (it->limbo_epoch > expiry_epoch) {
+                ++it;
+                continue;
+            }
+            out_unbinds.push_back(vk::SparseMemoryBind{
                 .resourceOffset = it->buffer_offset,
                 .size = it->size,
                 .memory = VK_NULL_HANDLE,
                 .memoryOffset = 0,
             });
-            sparse_coverage.Subtract(it->buffer_offset, it->size);
-            sparse_bound_bytes -= it->size;
-            reclaimed += it->size;
-            on_drop(it->buffer_offset, it->size, it->allocation);
-            it = sparse_blocks.erase(it);
+            out_allocations.push_back(it->allocation);
+            released += it->size;
+            limbo_bytes -= it->size;
+            on_expired(it->buffer_offset, it->size);
+            it = limbo_blocks.erase(it);
         }
-        return reclaimed;
+        return released;
     }
 
     /// Calls func(offset, size) for each maximal contiguous bound range (adjacent blocks merged).
@@ -211,6 +266,8 @@ struct UniqueBuffer {
     VkDeviceSize sparse_size{};
     VkDeviceSize sparse_bound_bytes{};
     std::vector<SparseBlock> sparse_blocks; ///< Sorted by buffer_offset, non-overlapping.
+    std::vector<SparseBlock> limbo_blocks;  ///< Victim stage: bound, uncovered, awaiting expiry.
+    u64 limbo_bytes{};
     /// Coalesced bound ranges; range queries use this so a buffer that accumulated many small
     /// demand bindings stays cheap to check.
     SparseCoverage sparse_coverage;
@@ -236,7 +293,7 @@ public:
                     std::vector<vk::SparseMemoryBind>& out_binds) {
         const u64 bound =
             buffer.BindRange(offset, size, usage, epoch, allocation_failure_callback, out_binds);
-        allocation_size = buffer.sparse_bound_bytes;
+        allocation_size = buffer.sparse_bound_bytes + buffer.limbo_bytes;
         return bound;
     }
 
@@ -247,16 +304,37 @@ public:
         }
     }
 
-    /// Sparse buffers only. See UniqueBuffer::ReclaimColdBlocks.
-    template <typename CanDrop, typename OnDrop>
-    u64 ReclaimColdSparseBlocks(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
-                                CanDrop&& can_drop, OnDrop&& on_drop,
-                                std::vector<vk::SparseMemoryBind>& out_binds) {
-        const u64 reclaimed = buffer.ReclaimColdBlocks(cutoff_epoch, current_epoch, max_bytes,
-                                                       std::forward<CanDrop>(can_drop),
-                                                       std::forward<OnDrop>(on_drop), out_binds);
-        allocation_size = buffer.sparse_bound_bytes;
-        return reclaimed;
+    /// Sparse buffers only. See UniqueBuffer::MoveColdBlocksToLimbo.
+    template <typename CanDrop>
+    u64 MoveColdSparseBlocksToLimbo(u64 cutoff_epoch, u64 current_epoch, u64 max_bytes,
+                                    CanDrop&& can_drop) {
+        return buffer.MoveColdBlocksToLimbo(cutoff_epoch, current_epoch, max_bytes,
+                                            std::forward<CanDrop>(can_drop));
+    }
+
+    /// Sparse buffers only. See UniqueBuffer::ReinstateLimboRange.
+    template <typename OnReinstate>
+    void ReinstateSparseRange(u64 offset, u64 size, u64 epoch, OnReinstate&& on_reinstate) {
+        if (buffer.is_sparse) {
+            buffer.ReinstateLimboRange(offset, size, epoch,
+                                       std::forward<OnReinstate>(on_reinstate));
+        }
+    }
+
+    /// Sparse buffers only. See UniqueBuffer::CollectExpiredLimbo.
+    template <typename OnExpired>
+    u64 CollectExpiredSparseLimbo(u64 expiry_epoch, OnExpired&& on_expired,
+                                  std::vector<vk::SparseMemoryBind>& out_unbinds,
+                                  std::vector<VmaAllocation>& out_allocations) {
+        const u64 released = buffer.CollectExpiredLimbo(
+            expiry_epoch, std::forward<OnExpired>(on_expired), out_unbinds, out_allocations);
+        allocation_size = buffer.sparse_bound_bytes + buffer.limbo_bytes;
+        return released;
+    }
+
+    /// Sparse buffers only: bytes parked in the victim stage (still resident).
+    [[nodiscard]] u64 LimboBytes() const noexcept {
+        return buffer.limbo_bytes;
     }
 
     /// Sparse buffers only: exempts blocks in the range from reclaim until until_epoch.

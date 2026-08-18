@@ -963,6 +963,11 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
         // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the
         // request stay unbound until they are first touched.
         const size_t takeover_bind_count = sparse_binds.size();
+        new_buffer.ReinstateSparseRange(device_addr - overlap.begin, wanted_size, gc_tick,
+                                        [&](u64 block_offset, u64 block_size, u64 limbo_epoch) {
+                                            ++stats.reinstatements;
+                                            stats.reinstated_bytes += block_size;
+                                        });
         new_buffer.EnsureBound(device_addr - overlap.begin, wanted_size, gc_tick,
                                allocation_failure_callback, sparse_binds);
         NoteDemandBinds(
@@ -1146,6 +1151,19 @@ void BufferCache::EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size) 
     // Every synchronized access stamps the covered blocks' GC epoch; the cold-block sweep only
     // unbinds blocks whose stamp is hundreds of epochs old.
     buffer.TouchSparseRange(offset, size, gc_tick);
+    if (buffer.IsRangeBound(offset, size)) {
+        return;
+    }
+    // Victim-stage recall: blocks still holding their memory come back for free - no bind, no
+    // upload, BDA intact. The revisit distance still earns the block a protection pin.
+    buffer.ReinstateSparseRange(
+        offset, size, gc_tick, [&](u64 block_offset, u64 block_size, u64 limbo_epoch) {
+            ++stats.reinstatements;
+            stats.reinstated_bytes += block_size;
+            const u64 distance = gc_tick - limbo_epoch;
+            buffer.ProtectSparseRange(block_offset, block_size,
+                                      gc_tick + std::clamp<u64>(2 * distance, 512, 8192));
+        });
     if (buffer.IsRangeBound(offset, size)) {
         return;
     }
@@ -1515,22 +1533,21 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
         return;
     }
     const u64 cutoff = gc_tick - min_age;
-    u64 sweep_cap = std::min<u64>(budget.bytes_remaining, 512_MB);
+    // Phase 1 - expiry: limbo blocks whose grace period ended are actually released. The BDA
+    // page-table entries are cleared in THIS batch (after its draws, which still see the old,
+    // valid state), and the unbind itself is deferred to the next submission, where it waits for
+    // this batch's completion on the master timeline. Run 45's corruption came from the inverse
+    // order: the unbind executed before the batch whose draws still read the entries.
+    const u64 limbo_expiry = gc_tick > LimboGraceEpochs ? gc_tick - LimboGraceEpochs : 0;
     ForEachBufferInRange(0, std::numeric_limits<VAddr>::max(), [&](BufferId id, Buffer& buffer) {
-        if (sweep_cap == 0 || !buffer.IsSparse() || buffer.is_deleted) {
+        if (!buffer.IsSparse() || buffer.is_deleted) {
             return;
         }
         std::vector<vk::SparseMemoryBind> unbinds;
-        boost::container::small_vector<VmaAllocation, 16> freed;
-        const u64 reclaimed = buffer.ReclaimColdSparseBlocks(
-            cutoff, gc_tick, sweep_cap,
+        std::vector<VmaAllocation> freed;
+        const u64 released = buffer.CollectExpiredSparseLimbo(
+            limbo_expiry,
             [&](u64 offset, u64 block_size) {
-                const VAddr addr = buffer.CpuAddr() + offset;
-                return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
-                       !preemptive_downloads.Intersects(addr, block_size) &&
-                       !IsRegionGpuModified(addr, block_size);
-            },
-            [&](u64 offset, u64 block_size, VmaAllocation allocation) {
                 const VAddr addr = buffer.CpuAddr() + offset;
                 // Metadata ghost per 64 KiB page: a later demand bind of this range reveals the
                 // true re-reference distance and pins the rebound blocks accordingly.
@@ -1547,25 +1564,44 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
                     bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
                 bda_pagetable_buffer.Fill(pt_offset,
                                           (page_end - page_begin) * sizeof(vk::DeviceAddress), 0);
-                freed.push_back(allocation);
             },
-            unbinds);
+            unbinds, freed);
         if (unbinds.empty()) {
             return;
         }
-        scheduler.BindSparse(buffer.Handle(), unbinds);
-        scheduler.DeferOperation(
-            [allocator = instance.GetAllocator(),
-             allocations = std::vector<VmaAllocation>(freed.begin(), freed.end())] {
+        scheduler.QueueDeferredSparseUnbind(
+            buffer.Handle(), unbinds,
+            [allocator = instance.GetAllocator(), allocations = std::move(freed)] {
                 for (VmaAllocation allocation : allocations) {
                     vmaFreeMemory(allocator, allocation);
                 }
             });
-        budget.Reclaim(reclaimed);
-        result.reclaimed_bytes += reclaimed;
         stats.block_reclaims += unbinds.size();
-        stats.block_reclaimed_bytes += reclaimed;
-        sweep_cap -= std::min(sweep_cap, reclaimed);
+        stats.block_reclaimed_bytes += released;
+    });
+    // Phase 2 - admission: cold blocks move to limbo. No Vulkan operation, no tracker change,
+    // no BDA change - the memory stays bound and valid, only coverage is withdrawn so demand
+    // routes through reinstatement (which restores the block for free). With 71% of measured
+    // revisits under 256 epochs (Run 45 histogram), the grace period absorbs the bulk of the
+    // former reclaim->rebind treadmill.
+    u64 sweep_cap = std::min<u64>(budget.bytes_remaining, 512_MB);
+    ForEachBufferInRange(0, std::numeric_limits<VAddr>::max(), [&](BufferId id, Buffer& buffer) {
+        if (sweep_cap == 0 || !buffer.IsSparse() || buffer.is_deleted) {
+            return;
+        }
+        const u64 moved = buffer.MoveColdSparseBlocksToLimbo(
+            cutoff, gc_tick, sweep_cap, [&](u64 offset, u64 block_size) {
+                const VAddr addr = buffer.CpuAddr() + offset;
+                return !gpu_modified_ranges_pending.Intersects(addr, block_size) &&
+                       !preemptive_downloads.Intersects(addr, block_size) &&
+                       !IsRegionGpuModified(addr, block_size);
+            });
+        if (moved == 0) {
+            return;
+        }
+        budget.Reclaim(moved);
+        result.reclaimed_bytes += moved;
+        sweep_cap -= std::min(sweep_cap, moved);
     });
     if (reclaim_ghosts.size() > 131072) {
         // Entries this old are dead history (nothing re-references them); drop them so the map
@@ -1722,6 +1758,7 @@ BufferCache::Statistics BufferCache::GetStatistics() {
         if (!IsBufferInvalid(id)) {
             ++snapshot.live_buffers;
             snapshot.bound_bytes += slot_buffers[id].AllocationSizeBytes();
+            snapshot.limbo_bytes += slot_buffers[id].LimboBytes();
         }
     });
     return snapshot;

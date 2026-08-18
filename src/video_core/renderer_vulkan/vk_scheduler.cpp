@@ -172,7 +172,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
     const bool has_sparse_binds = !pending_sparse_binds.empty();
-    if (has_sparse_binds) {
+    const bool has_sparse_unbinds = !armed_sparse_unbinds.empty();
+    if (has_sparse_binds || has_sparse_unbinds) {
         if (!sparse_bind_semaphore) {
             const vk::StructureChain semaphore_chain = {
                 vk::SemaphoreCreateInfo{},
@@ -188,8 +189,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             sparse_bind_semaphore = std::move(semaphore);
         }
         // Sparse binding operations complete asynchronously with respect to command execution;
-        // this submission must not start before the binds it depends on finish.
-        info.AddWait(*sparse_bind_semaphore, sparse_bind_value + 1,
+        // this submission must not start before the binds it depends on finish. Deferred unbinds
+        // and regular binds flush as separate, semaphore-chained operations.
+        const u64 groups = (has_sparse_unbinds ? 1u : 0u) + (has_sparse_binds ? 1u : 0u);
+        info.AddWait(*sparse_bind_semaphore, sparse_bind_value + groups,
                      vk::PipelineStageFlagBits::eAllCommands);
     }
 
@@ -228,6 +231,53 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         lock_end = std::chrono::steady_clock::now();
         ImGui::Core::TextureManager::Submit();
         imgui_end = std::chrono::steady_clock::now();
+        if (has_sparse_unbinds) {
+            SetSubmitCriticalPhase(SubmitCriticalPhase::SparseBind);
+            const u64 unbind_signal_value = ++sparse_bind_value;
+            u64 unbind_wait_tick = 0;
+            boost::container::small_vector<vk::SparseBufferMemoryBindInfo, 8> unbind_infos;
+            for (const DeferredSparseUnbind& unbind : armed_sparse_unbinds) {
+                unbind_infos.push_back(vk::SparseBufferMemoryBindInfo{
+                    .buffer = unbind.buffer,
+                    .bindCount = static_cast<u32>(unbind.binds.size()),
+                    .pBinds = unbind.binds.data(),
+                });
+                unbind_wait_tick = std::max(unbind_wait_tick, unbind.wait_tick);
+            }
+            // The unbind releases memory that batches up to wait_tick may still read: it waits
+            // for their completion on the master timeline. Regular binds this submission wait on
+            // the unbind in turn, so a re-bind of the same range lands after it and wins.
+            const vk::Semaphore unbind_wait_semaphore = master_semaphore.Handle();
+            const vk::Semaphore unbind_semaphore = *sparse_bind_semaphore;
+            const vk::TimelineSemaphoreSubmitInfo unbind_timeline_info = {
+                .waitSemaphoreValueCount = 1,
+                .pWaitSemaphoreValues = &unbind_wait_tick,
+                .signalSemaphoreValueCount = 1,
+                .pSignalSemaphoreValues = &unbind_signal_value,
+            };
+            const vk::BindSparseInfo unbind_info = {
+                .pNext = &unbind_timeline_info,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = &unbind_wait_semaphore,
+                .bufferBindCount = static_cast<u32>(unbind_infos.size()),
+                .pBufferBinds = unbind_infos.data(),
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = &unbind_semaphore,
+            };
+            const vk::Result unbind_result =
+                instance.GetGraphicsQueue().bindSparse(unbind_info, VK_NULL_HANDLE);
+            if (unbind_result == vk::Result::eErrorDeviceLost) {
+                instance.ReportDeviceLoss("sparse memory unbinding");
+            }
+            ASSERT_MSG(unbind_result == vk::Result::eSuccess,
+                       "Failed to unbind sparse buffer memory: {}", vk::to_string(unbind_result));
+            for (DeferredSparseUnbind& unbind : armed_sparse_unbinds) {
+                if (unbind.on_complete) {
+                    DeferOperation(std::move(unbind.on_complete));
+                }
+            }
+            armed_sparse_unbinds.clear();
+        }
         if (has_sparse_binds) {
             SetSubmitCriticalPhase(SubmitCriticalPhase::SparseBind);
             const u64 bind_signal_value = ++sparse_bind_value;
@@ -242,12 +292,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 total_ranges += pending.binds.size();
             }
             const vk::Semaphore bind_semaphore = *sparse_bind_semaphore;
+            const u64 bind_wait_value = bind_signal_value - 1;
             const vk::TimelineSemaphoreSubmitInfo bind_timeline_info = {
+                .waitSemaphoreValueCount = has_sparse_unbinds ? 1u : 0u,
+                .pWaitSemaphoreValues = &bind_wait_value,
                 .signalSemaphoreValueCount = 1,
                 .pSignalSemaphoreValues = &bind_signal_value,
             };
             const vk::BindSparseInfo bind_info = {
                 .pNext = &bind_timeline_info,
+                .waitSemaphoreCount = has_sparse_unbinds ? 1u : 0u,
+                .pWaitSemaphores = &bind_semaphore,
                 .bufferBindCount = static_cast<u32>(buffer_binds.size()),
                 .pBufferBinds = buffer_binds.data(),
                 .signalSemaphoreCount = 1,
@@ -284,6 +339,15 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result == vk::Result::eSuccess, "Failed to submit command buffer: {}",
                vk::to_string(submit_result));
 
+    if (!staged_sparse_unbinds.empty()) {
+        // Armed for the NEXT submission: the unbind waits for the batch just submitted (whose
+        // recording carried the BDA page-table clears for these ranges) to fully complete.
+        for (DeferredSparseUnbind& staged : staged_sparse_unbinds) {
+            staged.wait_tick = signal_value;
+            armed_sparse_unbinds.push_back(std::move(staged));
+        }
+        staged_sparse_unbinds.clear();
+    }
     master_semaphore.Refresh();
     const auto refresh_end = std::chrono::steady_clock::now();
     AllocateWorkerCommandBuffers();
@@ -318,6 +382,17 @@ void Scheduler::BindSparse(vk::Buffer buffer, std::span<const vk::SparseMemoryBi
     }
     pending_sparse_binds.push_back(
         PendingSparseBind{buffer, std::vector<vk::SparseMemoryBind>{binds.begin(), binds.end()}});
+}
+
+void Scheduler::QueueDeferredSparseUnbind(vk::Buffer buffer,
+                                          std::span<const vk::SparseMemoryBind> binds,
+                                          std::function<void()> on_complete) {
+    if (binds.empty()) {
+        return;
+    }
+    staged_sparse_unbinds.push_back(
+        DeferredSparseUnbind{buffer, std::vector<vk::SparseMemoryBind>{binds.begin(), binds.end()},
+                             std::move(on_complete)});
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

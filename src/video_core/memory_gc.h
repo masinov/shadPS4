@@ -136,6 +136,12 @@ constexpr u32 GcMaxCheapScans = 16384;
 /// may unbind it. Conservative: BDA direct-memory accesses do not stamp epochs, so the age must
 /// comfortably exceed any realistic re-reference distance; a wrong drop self-heals through the
 /// fault path but costs a transient zero read.
+/// Grace period, in GC epochs, that a reclaimed sparse block spends in the victim stage with
+/// its memory and binding intact. Demand within the window reinstates it for free; only blocks
+/// that survive it unreferenced are actually unbound. Short: pressure exists while sweeping, so
+/// condemned memory should free promptly - the ghost pins handle repeat offenders.
+constexpr u64 LimboGraceEpochs = 32;
+
 [[nodiscard]] constexpr u64 SparseBlockReclaimMinAge(GcPressure pressure,
                                                      bool overshoot = false) noexcept {
     if (pressure == GcPressure::Critical || overshoot) {
