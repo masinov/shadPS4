@@ -137,7 +137,11 @@ bool TextureCache::IsReadbackViable(ImageId image_id, Image& image) {
             const bool contained = other.info.guest_address >= image.info.guest_address &&
                                    other.info.guest_address + other.info.guest_size <=
                                        image.info.guest_address + image.info.guest_size;
-            if (!contained || other.tick_accessed_last > image.tick_accessed_last ||
+            // Strictly older only: two same-range images touched in the same batch have equal
+            // ticks, and with a > comparison each would dominate the other - whichever readback
+            // applied first would clear the other's GpuModified and let divergent GPU content be
+            // evicted without a writeback. Ties block conversion in both directions.
+            if (!contained || other.tick_accessed_last >= image.tick_accessed_last ||
                 other.binding.is_bound || other.binding.is_target) {
                 viable = false;
             }
