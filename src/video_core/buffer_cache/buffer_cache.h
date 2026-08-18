@@ -264,6 +264,7 @@ public:
         u64 bound_bytes{};    ///< sum of AllocationSizeBytes over live buffers
         u64 block_reclaims{}; ///< sparse: cold blocks unbound by the GC sweep
         u64 block_reclaimed_bytes{};
+        u64 block_reclaim_age{}; ///< sparse: current adaptive age threshold, in GC epochs
         bool sparse{};
     };
 
@@ -341,6 +342,12 @@ private:
     Buffer bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;
     u64 gc_tick = 0;
+    // Reclaim -> rebind feedback: Run 43 released 20.9 GB of cold blocks and demanded 20.7 GB
+    // straight back (worst bind 1.9 s). The age threshold adapts to the measured ratio instead
+    // of guessing a constant: sustained rebinding doubles it, sustained headroom halves it.
+    u64 adaptive_block_age = 256;
+    u64 adapt_reclaimed_snapshot = 0;
+    u64 adapt_demand_snapshot = 0;
     bool sparse_buffers{};
     u64 pressure_allocation_log_count{};
     u64 chain_advance_log_count{};

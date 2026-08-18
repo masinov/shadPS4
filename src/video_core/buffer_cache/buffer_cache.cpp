@@ -1430,7 +1430,30 @@ void BufferCache::SweepColdSparseBlocks(GcBudget& budget, GcResult& result) {
     // and re-uploads. The unbind travels the batched BindSparse path, so previously submitted
     // work still reads the old binding; the allocation itself is freed only after the tick that
     // carries the unbind completes.
-    const u64 min_age = SparseBlockReclaimMinAge(budget.pressure, budget.overshoot);
+    const u64 reclaimed_delta = stats.block_reclaimed_bytes - adapt_reclaimed_snapshot;
+    const u64 demand_delta = stats.demand_bound_bytes - adapt_demand_snapshot;
+    if (reclaimed_delta >= 64_MB) {
+        // demand_bound_bytes also counts first-touch binds of genuinely new ranges, so the ratio
+        // overestimates round-tripping; that only errs toward keeping blocks longer.
+        const u64 previous_age = adaptive_block_age;
+        if (demand_delta * 2 >= reclaimed_delta && adaptive_block_age < 4096) {
+            adaptive_block_age *= 2;
+        } else if (demand_delta * 8 <= reclaimed_delta && adaptive_block_age > 256) {
+            adaptive_block_age /= 2;
+        }
+        if (adaptive_block_age != previous_age) {
+            LOG_INFO(Render_Vulkan,
+                     "Sparse block reclaim age adapted: {} -> {} epochs (reclaimed={} MiB, "
+                     "demand_bound={} MiB since last adaptation)",
+                     previous_age, adaptive_block_age, reclaimed_delta / 1_MB, demand_delta / 1_MB);
+        }
+        adapt_reclaimed_snapshot = stats.block_reclaimed_bytes;
+        adapt_demand_snapshot = stats.demand_bound_bytes;
+    }
+    const u64 min_age =
+        (budget.pressure == GcPressure::Critical || budget.overshoot)
+            ? std::max<u64>(SparseBlockReclaimMinAge(budget.pressure, true), adaptive_block_age / 4)
+            : adaptive_block_age;
     if (gc_tick <= min_age) {
         return;
     }
@@ -1621,6 +1644,7 @@ GcResult BufferCache::RunGarbageCollector(GcBudget& budget) {
 BufferCache::Statistics BufferCache::GetStatistics() {
     Statistics snapshot = stats;
     snapshot.sparse = sparse_buffers;
+    snapshot.block_reclaim_age = adaptive_block_age;
     snapshot.live_buffers = 0;
     snapshot.bound_bytes = 0;
     lru_cache.ForEachItemBelow(std::numeric_limits<u64>::max(), [&](BufferId id) {

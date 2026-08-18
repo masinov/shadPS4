@@ -792,19 +792,20 @@ void Rasterizer::OnSubmit() {
                      readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
                      readback_stats.aborted_image_alias, readback_stats.converted_aliases,
                      readback_stats.aborted_record_state, readback_stats.aborted_no_staging);
-            LOG_INFO(Render_Vulkan,
-                     "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
-                     "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "
-                     "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB), "
-                     "usage={} MiB",
-                     cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB,
-                     cache_stats.replacements, cache_stats.replacements_new,
-                     cache_stats.replacements_grow, cache_stats.replacements_bridge,
-                     cache_stats.replaced_bytes / 1_MB, cache_stats.sparse,
-                     cache_stats.demand_bindings, cache_stats.demand_bound_bytes / 1_MB,
-                     sparse_stats.count, sparse_stats.total_ms, sparse_stats.max_ms,
-                     cache_stats.block_reclaims, cache_stats.block_reclaimed_bytes / 1_MB,
-                     used_memory / 1_MB);
+            LOG_INFO(
+                Render_Vulkan,
+                "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
+                "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "
+                "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB, age={}), "
+                "usage={} MiB",
+                cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB, cache_stats.replacements,
+                cache_stats.replacements_new, cache_stats.replacements_grow,
+                cache_stats.replacements_bridge, cache_stats.replaced_bytes / 1_MB,
+                cache_stats.sparse, cache_stats.demand_bindings,
+                cache_stats.demand_bound_bytes / 1_MB, sparse_stats.count, sparse_stats.total_ms,
+                sparse_stats.max_ms, cache_stats.block_reclaims,
+                cache_stats.block_reclaimed_bytes / 1_MB, cache_stats.block_reclaim_age,
+                used_memory / 1_MB);
         }
     }
 }
