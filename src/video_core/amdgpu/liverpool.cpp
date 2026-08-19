@@ -1193,7 +1193,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 gpu_modified_ranges_pending.Subtract(rewind_addr, acb.size_bytes());
             }
 
-            //  ASSERT_MSG(rewind->Valid(), "Rewind valid bit must be set");
+            // Hardware stalls the CP at IT_REWIND until the producer sets the valid bit;
+            // everything after this packet is unpublished until then. The graphics queue's
+            // handler has always waited (see the gfx Rewind case) - the compute handler ran
+            // ahead, executing consumer dispatches against unwritten arguments and GDS state:
+            // the recurring indirect-dispatch device loss (runs 28..67, one shader spinning in
+            // its GDS consume loop on work that was never signaled, record-time args showing
+            // the previous iteration's values). Yield so the producer - the game's CPU or the
+            // graphics-queue task on this same thread - can run.
+            u64 rewind_yields = 0;
+            while (!rewind->Valid()) {
+                if (++rewind_yields == 10'000'000) {
+                    LOG_WARNING(Render,
+                                "Compute rewind valid bit still unset after {} yields; the "
+                                "producer appears stalled",
+                                rewind_yields);
+                }
+                YIELD_ASC(vqid);
+            }
             break;
         }
         case PM4ItOpcode::SetShReg: {
