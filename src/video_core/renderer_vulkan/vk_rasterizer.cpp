@@ -453,8 +453,16 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(address + offset, size, VideoCore::ObtainBufferFlags::IsWritten);
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
+    // With the clamp enabled the arguments are consumed by the clamp's compute pre-pass, not by
+    // the indirect stage - track that stage, or a later GPU write to the argument buffer would
+    // synchronize against DrawIndirect and race the clamp's read (torn arguments in, wrong-but-
+    // bounded dispatch out).
+    const bool clamp_enabled = Config::getUseIndirectDispatchClamp();
+    if (auto barrier =
+            buffer->GetBarrier(clamp_enabled ? vk::AccessFlagBits2::eShaderStorageRead
+                                             : vk::AccessFlagBits2::eIndirectCommandRead,
+                               clamp_enabled ? vk::PipelineStageFlagBits2::eComputeShader
+                                             : vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
     }
 
@@ -472,9 +480,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     // guest dispatch's set 0 - the shader executed against the clamp's buffers, corrupting
     // arbitrary memory. Order here is clamp first, guest descriptors second.
     const auto cmdbuf = scheduler.CommandBuffer();
-    const auto clamped_args = Config::getUseIndirectDispatchClamp()
-                                  ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base)
-                                  : DispatchGuard::ClampedArgs{buffer->Handle(), base};
+    const auto clamped_args = clamp_enabled ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base)
+                                            : DispatchGuard::ClampedArgs{buffer->Handle(), base};
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
