@@ -52,8 +52,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       storage_sync_{scheduler, buffer_cache, texture_cache},
       rt_sync_{instance, scheduler, texture_cache}, liverpool{liverpool_},
-      predication{instance, scheduler, buffer_cache}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool} {
+      predication{instance, scheduler, buffer_cache}, dispatch_guard{instance, scheduler},
+      memory{Core::Memory::Instance()}, pipeline_cache{instance, scheduler, liverpool} {
     buffer_cache.SetAllocationReclaimCallback(
         [this](u64 reclaim_target, u64 allocation_size, bool forced, bool allow_texture_gc) {
             ReclaimForAllocation(reclaim_target, allocation_size, forced, allow_texture_gc);
@@ -463,6 +463,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
 
     const bool predicated = liverpool->IsPacketPredicated();
     const auto cmdbuf = scheduler.CommandBuffer();
+    // Execution-time argument clamp: the arguments are GPU-written, so the values this dispatch
+    // consumes cannot be validated at record time, and out-of-range group counts hang the device
+    // (the indirect-dispatch TDR class: revs 28, 31B, 33, 49, 59, 63 x3 - all with
+    // record_time_groups=0x1x1 and the executed arguments unknown). Sane arguments pass through
+    // byte-identical; insane ones are clamped and counted (see the stats interval log line).
+    const auto clamped_args = Config::getUseIndirectDispatchClamp()
+                                  ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base)
+                                  : DispatchGuard::ClampedArgs{buffer->Handle(), base};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     predication.BeginDraw(cmdbuf, std::nullopt, predicated);
     // Snapshot the argument values as guest memory holds them now. For CPU-written arguments
@@ -498,7 +506,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
         checkpoint.record_time_groups = true;
         instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::IndirectDispatch, checkpoint);
     }
-    cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    cmdbuf.dispatchIndirect(clamped_args.buffer, clamped_args.offset);
     predication.EndDraw(cmdbuf, std::nullopt, predicated);
     DebugState.IncDispatch();
 
@@ -810,6 +818,8 @@ void Rasterizer::OnSubmit() {
                 cache_stats.takeover_mismatches, cache_stats.fault_readbacks_read,
                 cache_stats.fault_readbacks_write, cache_stats.fault_readback_bytes / 1_MB,
                 cache_stats.fault_serviced_empty, used_memory / 1_MB);
+            LOG_INFO(Render_Vulkan, "Indirect dispatch clamp: clamped={}",
+                     dispatch_guard.ClampCount());
             LOG_INFO(Render_Vulkan,
                      "Sparse reclaim ghosts: hits={} ({} MiB), live={}, limbo={} MiB, "
                      "reinstated={} ({} MiB), rescued={} ({} MiB), distance histogram "

@@ -246,6 +246,7 @@ void setUseHostMemoryFallback(bool enable);
 bool getUseSparseCacheBuffers();
 bool getUseEvictionReadback();
 bool getUseSparseBlockReclaim();
+bool getUseIndirectDispatchClamp();
 void setUseSparseCacheBuffers(bool enable);
 int getMemoryCompressionLevel();
 void setMemoryCompressionLevel(int level);

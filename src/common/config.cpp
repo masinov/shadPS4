@@ -252,6 +252,7 @@ static ConfigEntry<bool> useHostMemoryFallback(false);
 static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
+static ConfigEntry<bool> useIndirectDispatchClamp(true);
 static ConfigEntry<int> memoryCompressionLevel(0);
 static ConfigEntry<int> usbDeviceBackend(UsbBackendType::Real);
 static ConfigEntry<s32> cameraId(-1);
@@ -623,6 +624,10 @@ bool getUseEvictionReadback() {
 
 bool getUseSparseBlockReclaim() {
     return useSparseBlockReclaim.get();
+}
+
+bool getUseIndirectDispatchClamp() {
+    return useIndirectDispatchClamp.get();
 }
 
 int getMemoryCompressionLevel() {
@@ -1926,6 +1931,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useSparseCacheBuffers.setFromToml(general, "useSparseCacheBuffers", is_game_specific);
         useEvictionReadback.setFromToml(general, "useEvictionReadback", is_game_specific);
         useSparseBlockReclaim.setFromToml(general, "useSparseBlockReclaim", is_game_specific);
+        useIndirectDispatchClamp.setFromToml(general, "useIndirectDispatchClamp", is_game_specific);
         memoryCompressionLevel.setFromToml(general, "memoryCompressionLevel", is_game_specific);
         isNeo.setFromToml(general, "isPS4Pro", is_game_specific);
         isDevKit.setFromToml(general, "isDevKit", is_game_specific);
@@ -2414,6 +2420,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["useSparseCacheBuffers"] = useSparseCacheBuffers.base_value;
         data["General"]["useEvictionReadback"] = useEvictionReadback.base_value;
         data["General"]["useSparseBlockReclaim"] = useSparseBlockReclaim.base_value;
+        data["General"]["useIndirectDispatchClamp"] = useIndirectDispatchClamp.base_value;
         data["General"]["memoryCompressionLevel"] = memoryCompressionLevel.base_value;
         data["General"]["isShadNetEnabled"] = isShadNetEnabled.base_value;
         data["General"]["isTrophyPopupDisabled"] = isTrophyPopupDisabled.base_value;
@@ -2807,6 +2814,7 @@ void setDefaultValues() {
     useSparseCacheBuffers = false;
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
+    useIndirectDispatchClamp = true;
     memoryCompressionLevel = 0;
     extraDmemInMbytes = 0;
 

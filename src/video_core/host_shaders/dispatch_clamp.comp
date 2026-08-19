@@ -1,0 +1,41 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// Clamps indirect dispatch arguments to the device's group-count limit at execution time.
+// The arguments live in a GPU-written guest buffer, so no CPU-side validation can see the
+// values the dispatch will actually consume; garbage values hang the device (TDRs on the
+// indirect-dispatch pipelines across revs 28, 31B, 33, 49, 59 and 63). Sane arguments pass
+// through byte-identical; insane ones are clamped and counted so the event is loud instead
+// of fatal.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcArgs {
+    uint src_args[3];
+};
+
+layout(std430, binding = 1) writeonly buffer DstArgs {
+    uint dst_args[3];
+};
+
+layout(std430, binding = 2) buffer ClampCounter {
+    uint clamp_count;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint max_groups;
+} pc;
+
+void main() {
+    const uint x = src_args[0];
+    const uint y = src_args[1];
+    const uint z = src_args[2];
+    dst_args[0] = min(x, pc.max_groups);
+    dst_args[1] = min(y, pc.max_groups);
+    dst_args[2] = min(z, pc.max_groups);
+    if (x > pc.max_groups || y > pc.max_groups || z > pc.max_groups) {
+        atomicAdd(clamp_count, 1u);
+    }
+}

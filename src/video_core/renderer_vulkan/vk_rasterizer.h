@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/gpu_diagnostic_tracker.h"
 #include "video_core/renderer_vulkan/render_target_sync.h"
 #include "video_core/renderer_vulkan/storage_image_sync.h"
+#include "video_core/renderer_vulkan/vk_dispatch_guard.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_predication.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -193,6 +194,7 @@ private:
     bool gc_texture_first{true};
     VideoCore::GcPressure gc_pressure{VideoCore::GcPressure::None};
     PredicationManager predication;
+    DispatchGuard dispatch_guard;
 };
 
 } // namespace Vulkan
