@@ -265,14 +265,16 @@ public:
         u64 fault_readbacks_read{};    ///< armed-protection services triggered by CPU reads
         u64 fault_readbacks_write{};   ///< armed-protection services triggered by CPU writes
         u64 fault_readback_bytes{};    ///< bytes actually written back by download services
-        u64 fault_serviced_empty{};    ///< services that found no tracker data (raced) - state
-                                       ///< transition still completed
-        u64 takeover_mismatches{};     ///< sparse merges where taken bytes != absorbed bytes
-        u64 replacements_new{};        ///< ... with no overlap
-        u64 replacements_grow{};       ///< ... with exactly one overlap
-        u64 replacements_bridge{};     ///< ... with two or more overlaps
-        u64 replaced_bytes{};          ///< bytes of absorbed buffers (copied or aliased)
-        u64 demand_bindings{};         ///< sparse: EnsureRangeBound calls that bound something
+        u64 fault_serviced_empty{};
+        u64 uploads{};      ///< guest->device synchronization copies (the true load-pressure gauge)
+        u64 upload_bytes{}; ///< services that found no tracker data (raced) - state
+                            ///< transition still completed
+        u64 takeover_mismatches{}; ///< sparse merges where taken bytes != absorbed bytes
+        u64 replacements_new{};    ///< ... with no overlap
+        u64 replacements_grow{};   ///< ... with exactly one overlap
+        u64 replacements_bridge{}; ///< ... with two or more overlaps
+        u64 replaced_bytes{};      ///< bytes of absorbed buffers (copied or aliased)
+        u64 demand_bindings{};     ///< sparse: EnsureRangeBound calls that bound something
         u64 demand_bound_bytes{};
         u64 live_buffers{};
         u64 bound_bytes{};    ///< sum of AllocationSizeBytes over live buffers

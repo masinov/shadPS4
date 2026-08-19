@@ -24,8 +24,12 @@ std::string FormatLogMessage(const Entry& entry) {
     const char* class_name = GetLogClassName(entry.log_class);
     const char* level_name = GetLevelName(entry.log_level);
 
-    return fmt::format("[{}] <{}> ({}) {}:{} {}: {}", class_name, level_name, entry.thread,
-                       entry.filename, entry.line_num, entry.function, entry.message);
+    // Seconds since emulator start with microsecond fraction. Three timeline analyses in the
+    // Bloodborne corruption investigation failed for want of this field; the value was already
+    // computed here and simply never printed.
+    return fmt::format("[{:5}.{:06}] [{}] <{}> ({}) {}:{} {}: {}", time_seconds, time_fractional,
+                       class_name, level_name, entry.thread, entry.filename, entry.line_num,
+                       entry.function, entry.message);
 }
 
 void PrintMessage(const Entry& entry) {

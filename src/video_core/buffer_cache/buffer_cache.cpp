@@ -1365,6 +1365,8 @@ vk::Buffer BufferCache::UploadCopies(const Buffer& buffer, std::span<vk::BufferC
     if (copies.empty()) {
         return VK_NULL_HANDLE;
     }
+    ++stats.uploads;
+    stats.upload_bytes += total_size_bytes;
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
     if (staging) {
         for (auto& copy : copies) {

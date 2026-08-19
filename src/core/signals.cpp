@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <csignal>
+#include <exception>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
+
 #include "core/signals.h"
 #include "core/veh_stack.h"
 
@@ -180,6 +183,16 @@ static LONG WINAPI UnhandledCrashFilter(EXCEPTION_POINTERS* pointers) {
                  fmt::UTF(dump_path.u8string()));
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+// Runs 35 and 64 died with no dump, no WER entry and a log truncated mid-write: paths through
+// std::terminate / abort / fastfail bypass SetUnhandledExceptionFilter entirely. Raising a
+// software exception from the terminate handler routes those deaths through the same filter and
+// produces the same crash.dmp.
+[[noreturn]] static void TerminateDumpHandler() {
+    RaiseException(0xE000DEADu, 0, 0, nullptr);
+    // RaiseException returns if a handler continued execution; nothing sane remains.
+    ExitProcess(0xE000DEADu);
+}
 #endif
 
 SignalDispatch::SignalDispatch() {
@@ -187,6 +200,10 @@ SignalDispatch::SignalDispatch() {
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");
     SetUnhandledExceptionFilter(UnhandledCrashFilter);
+    std::set_terminate(TerminateDumpHandler);
+    // Route abort() through the unhandled filter as well instead of fastfailing silently.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    std::signal(SIGABRT, [](int) { TerminateDumpHandler(); });
 #else
     struct sigaction action{};
     action.sa_sigaction = SignalHandler;
