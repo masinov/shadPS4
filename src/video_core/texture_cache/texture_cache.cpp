@@ -28,6 +28,25 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+namespace {
+/// Hashes guest content through the physical backing view: emulator-internal reads must not trip
+/// armed readback protection (each fault costs a synchronous GPU drain, and the serviced download
+/// then changes the very bytes being hashed - Run 58's flashing). The bytes are identical to the
+/// protected view's; only the page protection is bypassed. Falls back to the virtual view when a
+/// range has no full physical backing.
+[[nodiscard]] u64 HashGuestContent(VAddr guest_address, u64 size) {
+    static thread_local XXH3_state_t* const state = XXH3_createState();
+    XXH3_64bits_reset(state);
+    const bool walked = Core::Memory::Instance()->ForEachBackingChunk(
+        std::bit_cast<const void*>(guest_address), size,
+        [](const u8* chunk, u64 chunk_size) { XXH3_64bits_update(state, chunk, chunk_size); });
+    if (!walked) {
+        return XXH3_64bits(std::bit_cast<const u8*>(guest_address), size);
+    }
+    return XXH3_64bits_digest(state);
+}
+} // namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& page_manager_)
@@ -321,7 +340,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+        image.hash = HashGuestContent(image.info.guest_address, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -956,7 +975,7 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 w = std::min(image.info.size.width, u32(8));
         const u32 h = std::min(image.info.size.height, u32(8));
         const u32 size = w * h * image.info.num_bits >> (3 + image.info.props.is_block ? 4 : 0);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u64 hash = HashGuestContent(image.info.guest_address, size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -980,7 +999,7 @@ void TextureCache::RefreshImage(Image& image) {
         // Protect GPU modified resources from accidental CPU reuploads.
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+            const u64 hash = HashGuestContent(image.info.guest_address + mip_offset, mip_size);
             if (image.mip_hashes[m] == hash) {
                 continue;
             }
@@ -1257,7 +1276,12 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             // GPU-authored contents cannot be discarded, but they can be written back to guest
             // memory asynchronously; once that completes the image is CPU-authoritative and a
             // later pass can evict it. Nominate a bounded number of large candidates per pass.
+            // The eviction readback was designed for readbackSpeed=Disable, where nothing else
+            // writes GPU snapshots into guest memory. Under armed modes the tracker-driven
+            // service owns that job; two overlapping writers with live protection is untested
+            // interplay with no upside.
             if (Config::getUseEvictionReadback() &&
+                Config::readbackSpeed() == Config::ReadbackSpeed::Disable &&
                 False(image.flags & ImageFlagBits::EvictionReadback) &&
                 False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&

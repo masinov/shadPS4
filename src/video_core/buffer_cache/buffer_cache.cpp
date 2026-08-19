@@ -149,6 +149,14 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    // The armed-protection service path had no observability at all (Run 58's report could not
+    // verify a single serviced fault); count reads and writes separately.
+    if (is_write) {
+        ++stats.fault_readbacks_write;
+    } else {
+        ++stats.fault_readbacks_read;
+    }
+    stats.fault_readback_bytes += size;
     // if write tick == current_tick -> send flush request
 
     const u64 page = device_addr >> CACHING_PAGEBITS;

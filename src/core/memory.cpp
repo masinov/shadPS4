@@ -228,6 +228,46 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     return true;
 }
 
+bool MemoryManager::ForEachBackingChunk(const void* address, u64 size,
+                                        const std::function<void(const u8*, u64)>& func) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    std::shared_lock lk{mutex};
+    ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
+               virtual_addr);
+
+    std::vector<VirtualMemoryArea> vmas_to_read;
+    auto current_vma = FindVMA(virtual_addr);
+    while (current_vma->second.Overlaps(virtual_addr, size)) {
+        if (!HasPhysicalBacking(current_vma->second)) {
+            break;
+        }
+        vmas_to_read.emplace_back(current_vma->second);
+        current_vma++;
+    }
+    if (vmas_to_read.empty()) {
+        return false;
+    }
+
+    u64 remaining = size;
+    for (auto& vma : vmas_to_read) {
+        auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
+        auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+        for (; phys_handle != vma.phys_areas.end(); phys_handle++) {
+            if (!remaining) {
+                break;
+            }
+            const u64 start_in_dma =
+                std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
+            const u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
+            const u64 chunk_size =
+                std::min<u64>(remaining, phys_handle->second.size - start_in_dma);
+            func(backing, chunk_size);
+            remaining -= chunk_size;
+        }
+    }
+    return remaining == 0;
+}
+
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 64_KB;

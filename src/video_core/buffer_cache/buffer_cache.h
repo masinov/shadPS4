@@ -262,12 +262,15 @@ public:
         u64 replacements{};            ///< CreateBuffer calls
         u64 stale_slot_rebinds{};      ///< binding hints that pointed at a reused slot (raced GC)
         u64 vertex_residency_misses{}; ///< vertex bindings whose V# extent was not resident
-        u64 takeover_mismatches{};     ///< sparse merges where taken bytes != absorbed bytes
-        u64 replacements_new{};        ///< ... with no overlap
-        u64 replacements_grow{};       ///< ... with exactly one overlap
-        u64 replacements_bridge{};     ///< ... with two or more overlaps
-        u64 replaced_bytes{};          ///< bytes of absorbed buffers (copied or aliased)
-        u64 demand_bindings{};         ///< sparse: EnsureRangeBound calls that bound something
+        u64 fault_readbacks_read{};    ///< armed-protection services triggered by CPU reads
+        u64 fault_readbacks_write{};   ///< armed-protection services triggered by CPU writes
+        u64 fault_readback_bytes{};
+        u64 takeover_mismatches{}; ///< sparse merges where taken bytes != absorbed bytes
+        u64 replacements_new{};    ///< ... with no overlap
+        u64 replacements_grow{};   ///< ... with exactly one overlap
+        u64 replacements_bridge{}; ///< ... with two or more overlaps
+        u64 replaced_bytes{};      ///< bytes of absorbed buffers (copied or aliased)
+        u64 demand_bindings{};     ///< sparse: EnsureRangeBound calls that bound something
         u64 demand_bound_bytes{};
         u64 live_buffers{};
         u64 bound_bytes{};    ///< sum of AllocationSizeBytes over live buffers

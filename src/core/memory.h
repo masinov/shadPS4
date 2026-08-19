@@ -255,6 +255,15 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    /// Walks the physical backing of [address, address + size) and calls
+    /// func(const u8* chunk, u64 chunk_size) for each contiguous piece, bypassing any guest page
+    /// protection. Returns false (without calling func) when the range has no full physical
+    /// backing. The read-side twin of TryWriteBacking: emulator-internal readers (e.g. content
+    /// hashing) must not fault through armed readback protection, and the bytes are identical to
+    /// the protected view's.
+    bool ForEachBackingChunk(const void* address, u64 size,
+                             const std::function<void(const u8*, u64)>& func);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
