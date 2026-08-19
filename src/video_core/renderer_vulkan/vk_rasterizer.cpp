@@ -459,18 +459,26 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
-    const bool predicated = liverpool->IsPacketPredicated();
-    const auto cmdbuf = scheduler.CommandBuffer();
     // Execution-time argument clamp: the arguments are GPU-written, so the values this dispatch
     // consumes cannot be validated at record time, and out-of-range group counts hang the device
     // (the indirect-dispatch TDR class: revs 28, 31B, 33, 49, 59, 63 x3 - all with
     // record_time_groups=0x1x1 and the executed arguments unknown). Sane arguments pass through
     // byte-identical; insane ones are clamped and counted (see the stats interval log line).
+    //
+    // The clamp records its own pipeline bind and push-descriptor write, so it MUST run before
+    // the guest pipeline's BindResources below: push-descriptor state is per-set command-buffer
+    // state, and recording the clamp after the guest push (run 64's placement) clobbered the
+    // guest dispatch's set 0 - the shader executed against the clamp's buffers, corrupting
+    // arbitrary memory. Order here is clamp first, guest descriptors second.
+    const auto cmdbuf = scheduler.CommandBuffer();
     const auto clamped_args = Config::getUseIndirectDispatchClamp()
                                   ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base)
                                   : DispatchGuard::ClampedArgs{buffer->Handle(), base};
+
+    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+
+    const bool predicated = liverpool->IsPacketPredicated();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     predication.BeginDraw(cmdbuf, std::nullopt, predicated);
     // Snapshot the argument values as guest memory holds them now. For CPU-written arguments
