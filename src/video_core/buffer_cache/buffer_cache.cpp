@@ -76,26 +76,39 @@ template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
+    const VAddr clamp_begin = buffer.CpuAddr();
+    const VAddr clamp_end = clamp_begin + buffer.SizeBytes();
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
-            const VAddr buffer_addr = buffer.CpuAddr();
-            const auto add_download = [&](VAddr start, VAddr end) {
-                const u64 new_offset = start - buffer_addr;
-                const u64 new_size = end - start;
-                copies.push_back(vk::BufferCopy{
-                    .srcOffset = new_offset,
-                    .dstOffset = total_size_bytes,
-                    .size = new_size,
-                });
-                // Align up to avoid cache conflicts
-                constexpr u64 align = 64ULL;
-                constexpr u64 mask = ~(align - 1ULL);
-                total_size_bytes += (new_size + align - 1) & mask;
-            };
-            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+            // The tracker armed the fault, so the tracker decides what must be saved. Run 59
+            // intersected these ranges with the gpu_modified_ranges set instead and serviced
+            // 64,140 write faults with zero bytes: the set empties earlier than the tracker on
+            // async and preemptive flows, and every divergence silently abandoned GPU-authored
+            // data while leaving the page protected - the session-long cumulative corruption.
+            // The set is advisory bookkeeping now; still kept consistent below.
+            const VAddr start = std::max<VAddr>(device_addr_out, clamp_begin);
+            const VAddr end = std::min<VAddr>(device_addr_out + range_size, clamp_end);
+            if (start >= end) {
+                return;
+            }
+            copies.push_back(vk::BufferCopy{
+                .srcOffset = start - clamp_begin,
+                .dstOffset = total_size_bytes,
+                .size = end - start,
+            });
+            // Align up to avoid cache conflicts
+            constexpr u64 align = 64ULL;
+            constexpr u64 mask = ~(align - 1ULL);
+            total_size_bytes += ((end - start) + align - 1) & mask;
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
+    stats.fault_readback_bytes += total_size_bytes;
     if (total_size_bytes == 0) {
+        // Nothing left to save (a concurrent service raced this one) - but the state transition
+        // this call owes must still complete, or the page stays protected with stale tracker
+        // bits and faults forever: unmark, mark CPU-dirty on writes, lift protection.
+        ++stats.fault_serviced_empty;
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
         return;
     }
     const VAddr page_addr = PageManager::GetPageAddr(device_addr);
@@ -156,7 +169,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     } else {
         ++stats.fault_readbacks_read;
     }
-    stats.fault_readback_bytes += size;
+    // Service whole tracker pages: faults arrive with byte-sized ranges, but the tracker's state
+    // (and the unmark that ends the service) is page-granular - downloading only the faulted
+    // bytes while unmarking the page would silently drop the rest of the page's GPU data.
+    const VAddr aligned_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr aligned_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+    device_addr = aligned_begin;
+    size = aligned_end - aligned_begin;
     // if write tick == current_tick -> send flush request
 
     const u64 page = device_addr >> CACHING_PAGEBITS;

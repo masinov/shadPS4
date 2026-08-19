@@ -798,7 +798,7 @@ void Rasterizer::OnSubmit() {
                 "bridge={}), replaced={} MiB, sparse={}, demand_bindings={} ({} MiB), "
                 "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB, age={}), "
                 "stale_hints={}, vertex_misses={}, takeover_mismatches={}, "
-                "fault_readbacks={}r/{}w ({} MiB), usage={} MiB",
+                "fault_readbacks={}r/{}w ({} MiB, empty={}), usage={} MiB",
                 cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB, cache_stats.replacements,
                 cache_stats.replacements_new, cache_stats.replacements_grow,
                 cache_stats.replacements_bridge, cache_stats.replaced_bytes / 1_MB,
@@ -809,7 +809,7 @@ void Rasterizer::OnSubmit() {
                 cache_stats.stale_slot_rebinds, cache_stats.vertex_residency_misses,
                 cache_stats.takeover_mismatches, cache_stats.fault_readbacks_read,
                 cache_stats.fault_readbacks_write, cache_stats.fault_readback_bytes / 1_MB,
-                used_memory / 1_MB);
+                cache_stats.fault_serviced_empty, used_memory / 1_MB);
             LOG_INFO(Render_Vulkan,
                      "Sparse reclaim ghosts: hits={} ({} MiB), live={}, limbo={} MiB, "
                      "reinstated={} ({} MiB), rescued={} ({} MiB), distance histogram "
