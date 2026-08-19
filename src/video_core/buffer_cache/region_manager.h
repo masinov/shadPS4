@@ -93,6 +93,15 @@ public:
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
+        } else if constexpr (type == Type::CPU) {
+            // Same protect-before-clear ordering as ForEachModifiedRange: closing the window in
+            // which a concurrent game write is neither caught by a fault nor left marked dirty.
+            RegionBits cleaned(bits, start_page, end_page);
+            for (const auto& [arm_start, arm_end] : cleaned) {
+                writeable.UnsetRange(arm_start, arm_end);
+            }
+            tracker->UpdatePageWatchersForRegion<true, false>(cpu_addr, cleaned);
+            bits.UnsetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
         }
@@ -139,9 +148,25 @@ public:
         RegionBits mask(bits, start_page, end_page);
 
         if constexpr (clear) {
-            bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
-                UpdateProtection<true, false>();
+                // Arm the write watchers BEFORE clearing the dirty bits. With the old order, a
+                // game write landing between the clear and the mprotect neither faulted (page
+                // still writable) nor stayed marked (bits already cleared): the freshly streamed
+                // asset's bytes silently never uploaded again, and the draw rendered the previous
+                // occupant's stale data - the load-driven explosions of the whole series. The
+                // mprotect is the linearization point: writes before it are captured by the
+                // upload copy that follows this enumeration; writes after it fault, wait on the
+                // region lock, and re-mark the pages dirty for the next synchronization.
+                for (const auto& [arm_start, arm_end] : mask) {
+                    writeable.UnsetRange(arm_start, arm_end);
+                }
+                tracker->UpdatePageWatchersForRegion<true, false>(cpu_addr, mask);
+                bits.UnsetRange(start_page, end_page);
+            } else {
+                bits.UnsetRange(start_page, end_page);
+            }
+            if constexpr (type == Type::CPU) {
+                UpdateProtection<true, false>(); // reconciliation; no-op after the arming above
             } else if (Config::readbackSpeed() == Config::ReadbackSpeed::Disable) {
                 UpdateProtection<true, false>();
             } else if (Config::readbackSpeed() == Config::ReadbackSpeed::Unsafe) {
