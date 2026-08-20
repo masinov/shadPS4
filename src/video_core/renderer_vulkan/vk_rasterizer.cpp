@@ -811,12 +811,14 @@ void Rasterizer::OnSubmit() {
                      "Eviction readback: nominated={}, applied={}, aborted_dirty={}, "
                      "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}, "
                      "converted_aliases={}, aborted_record_state={}, aborted_no_staging={}, "
-                     "fault_services={}, fault_aborted_dirty={}, fault_aborted_viability={}",
+                     "fault_services={}, fault_aborted_dirty={}, fault_aborted_maybe={}, "
+                     "fault_aborted_viability={}",
                      readback_stats.nominated, readback_stats.applied, readback_stats.aborted_dirty,
                      readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
                      readback_stats.aborted_image_alias, readback_stats.converted_aliases,
                      readback_stats.aborted_record_state, readback_stats.aborted_no_staging,
                      readback_stats.fault_services, readback_stats.fault_aborted_dirty,
+                     readback_stats.fault_aborted_maybe_dirty,
                      readback_stats.fault_aborted_viability);
             LOG_INFO(
                 Render_Vulkan,

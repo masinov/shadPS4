@@ -356,12 +356,33 @@ u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
             False(image.flags & ImageFlagBits::GpuModified)) {
             continue; // converted by a dominant image serviced earlier in this loop
         }
-        // A CPU-dirty image means guest RAM holds newer bytes for part of the range; writing
-        // the GPU copy over them would destroy a guest write. Leave the range to the buffer
-        // service's result and count the abstention.
-        if (True(image.flags & ImageFlagBits::Dirty)) {
+        // Guest RAM (CpuDirty) or the buffer cache (GpuDirty) is the authority for this image;
+        // writing the device copy over either would destroy newer content. Abstain.
+        //
+        // ImageFlagBits::Dirty is a COMPOSITE of MaybeCpuDirty|CpuDirty|GpuDirty, and gating on
+        // the whole mask - as this did, copied from the eviction-readback flow - turned away 95%
+        // of all service attempts in run 72 (14,500 aborts against 750 services). Most of that
+        // population carries only MaybeCpuDirty, which is not evidence of a guest write at all:
+        // it means the image lies entirely inside a page the CPU touched *outside* the image's
+        // own bytes (InvalidateMemory sets the definite CpuDirty when the write actually
+        // overlaps). Tracking is dropped for that page, so a later write would go unseen - hence
+        // "maybe" - and the recorded content hash is what resolves it.
+        if (True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::GpuDirty))) {
             ++readback_stats.fault_aborted_dirty;
             continue;
+        }
+        if (True(image.flags & ImageFlagBits::MaybeCpuDirty)) {
+            // Resolve the maybe: if guest content still hashes to what it was when tracking was
+            // dropped, no guest write landed on the image and the device copy is authoritative.
+            // Full guest_size, matching MarkAsMaybeDirty's domain exactly - a partial hash could
+            // certify "unmodified" while later bytes differ, and here that would overwrite real
+            // guest data rather than merely skip an upload.
+            if (image.hash == 0 ||
+                HashGuestContent(image.info.guest_address, image.info.guest_size) != image.hash) {
+                ++readback_stats.fault_aborted_maybe_dirty;
+                continue;
+            }
+            image.flags &= ~ImageFlagBits::MaybeCpuDirty;
         }
         if (!IsReadbackViable(image_id, image)) {
             ++readback_stats.fault_aborted_viability;
@@ -1026,14 +1047,15 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-        const u32 size = w * h * image.info.num_bits >> (3 + image.info.props.is_block ? 4 : 0);
-        const u64 hash = HashGuestContent(image.info.guest_address, size);
+        // An image is only MaybeCpuDirty when it fits inside a single page, so hashing all of it
+        // is cheap (<= 4 KiB). It must be ALL of it: MarkAsMaybeDirty records the hash over the
+        // full guest_size, and this comparison used the first 64 pixels only. The two hash
+        // domains can never agree, so the early-out below never fired on a first check (every
+        // maybe-dirty image paid a full re-upload) - and worse, once a partial hash had been
+        // stored here, an image whose first 64 pixels were untouched but whose later bytes the
+        // guest had rewritten would certify as clean and skip the upload that would have brought
+        // those bytes in. Same-domain hashing fixes both directions.
+        const u64 hash = HashGuestContent(image.info.guest_address, image.info.guest_size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;

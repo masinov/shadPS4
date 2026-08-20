@@ -387,6 +387,7 @@ public:
         u64 aborted_no_staging{};
         u64 fault_services{};
         u64 fault_aborted_dirty{};
+        u64 fault_aborted_maybe_dirty{};
         u64 fault_aborted_viability{};
     };
 

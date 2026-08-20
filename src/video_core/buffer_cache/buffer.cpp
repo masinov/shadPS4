@@ -491,9 +491,17 @@ void StreamBuffer::Commit() {
     }
 
     offset += mapped_size;
+    // Coalesce with the watch written by the previous Commit, which lives at cursor - 1: the
+    // cursor is post-incremented when a watch is claimed, so it points at the next, unwritten
+    // slot. Indexing it read either a zero-initialised slot or a stale one from two generations
+    // back (the vectors are swapped and reused on wrap), whose tick can never equal the current
+    // tick - so the coalescing never fired and every upload consumed its own watch. Harmless to
+    // correctness (each watch carried its own exact upper_bound, which is the conservative
+    // direction) but it made WaitPendingOperations walk thousands of entries per ring wrap
+    // instead of a handful, on the hottest path this cache has.
     if (current_watch_cursor != 0 &&
-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
-        current_watches[current_watch_cursor].upper_bound = offset;
+        current_watches[current_watch_cursor - 1].tick == scheduler->CurrentTick()) {
+        current_watches[current_watch_cursor - 1].upper_bound = offset;
         return;
     }
 
