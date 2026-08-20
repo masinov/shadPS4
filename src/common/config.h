@@ -247,6 +247,8 @@ bool getUseSparseCacheBuffers();
 bool getUseEvictionReadback();
 bool getUseSparseBlockReclaim();
 bool getUseIndirectDispatchClamp();
+bool getForceAccuratePageWatchers();
+bool getForceRenderSync();
 void setUseSparseCacheBuffers(bool enable);
 int getMemoryCompressionLevel();
 void setMemoryCompressionLevel(int level);

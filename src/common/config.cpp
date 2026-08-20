@@ -253,6 +253,11 @@ static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<bool> useIndirectDispatchClamp(true);
+// Quirk lifts: the per-title quirk table trades accuracy for speed (merged page watchers make
+// CPU reads of GPU data unobservable; disabled render sync leaves render-target writes
+// unrecorded). These force the accurate paths back on for titles the table degrades.
+static ConfigEntry<bool> forceAccuratePageWatchers(false);
+static ConfigEntry<bool> forceRenderSync(false);
 static ConfigEntry<int> memoryCompressionLevel(0);
 static ConfigEntry<int> usbDeviceBackend(UsbBackendType::Real);
 static ConfigEntry<s32> cameraId(-1);
@@ -628,6 +633,14 @@ bool getUseSparseBlockReclaim() {
 
 bool getUseIndirectDispatchClamp() {
     return useIndirectDispatchClamp.get();
+}
+
+bool getForceAccuratePageWatchers() {
+    return forceAccuratePageWatchers.get();
+}
+
+bool getForceRenderSync() {
+    return forceRenderSync.get();
 }
 
 int getMemoryCompressionLevel() {
@@ -1932,6 +1945,9 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useEvictionReadback.setFromToml(general, "useEvictionReadback", is_game_specific);
         useSparseBlockReclaim.setFromToml(general, "useSparseBlockReclaim", is_game_specific);
         useIndirectDispatchClamp.setFromToml(general, "useIndirectDispatchClamp", is_game_specific);
+        forceAccuratePageWatchers.setFromToml(general, "forceAccuratePageWatchers",
+                                              is_game_specific);
+        forceRenderSync.setFromToml(general, "forceRenderSync", is_game_specific);
         memoryCompressionLevel.setFromToml(general, "memoryCompressionLevel", is_game_specific);
         isNeo.setFromToml(general, "isPS4Pro", is_game_specific);
         isDevKit.setFromToml(general, "isDevKit", is_game_specific);
@@ -2421,6 +2437,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["useEvictionReadback"] = useEvictionReadback.base_value;
         data["General"]["useSparseBlockReclaim"] = useSparseBlockReclaim.base_value;
         data["General"]["useIndirectDispatchClamp"] = useIndirectDispatchClamp.base_value;
+        data["General"]["forceAccuratePageWatchers"] = forceAccuratePageWatchers.base_value;
+        data["General"]["forceRenderSync"] = forceRenderSync.base_value;
         data["General"]["memoryCompressionLevel"] = memoryCompressionLevel.base_value;
         data["General"]["isShadNetEnabled"] = isShadNetEnabled.base_value;
         data["General"]["isTrophyPopupDisabled"] = isTrophyPopupDisabled.base_value;
@@ -2815,6 +2833,8 @@ void setDefaultValues() {
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
     useIndirectDispatchClamp = true;
+    forceAccuratePageWatchers = false;
+    forceRenderSync = false;
     memoryCompressionLevel = 0;
     extraDmemInMbytes = 0;
 

@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/config.h"
+
 #if defined(WIN32)
 #define EXPORT __declspec(dllexport)
 #else
@@ -84,6 +86,17 @@ inline GameQuirks ComputeGameQuirks(std::string_view serial) {
 inline void SetGameSerial(std::string serial) {
     g_game_serial = std::move(serial);
     g_game_quirks = ComputeGameQuirks(g_game_serial);
+    // Accuracy overrides: the quirk table trades correctness for speed. The merged fast-path
+    // watcher makes CPU reads of GPU-authored memory unobservable (a read can never fault, so
+    // the readback service can never run for it - a silent stale-read channel), and disabled
+    // render sync leaves render-target writes unrecorded. These lifts restore the accurate
+    // paths for measurement and, if affordable, for good.
+    if (Config::getForceAccuratePageWatchers()) {
+        g_game_quirks.fast_path_page_watchers = false;
+    }
+    if (Config::getForceRenderSync()) {
+        g_game_quirks.disable_render_sync = false;
+    }
 }
 
 [[nodiscard]] inline const GameQuirks& Quirks() noexcept {

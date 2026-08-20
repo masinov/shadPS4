@@ -386,6 +386,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     if (!id.empty()) {
         MemoryPatcher::SetGameSerial(id);
+        const auto& quirks = MemoryPatcher::Quirks();
+        LOG_INFO(Loader,
+                 "Game quirks for {}: fast_path_page_watchers={}, disable_render_sync={}, "
+                 "defer_write_protect={}, skip_rt_write_record={}",
+                 id, quirks.fast_path_page_watchers, quirks.disable_render_sync,
+                 quirks.defer_write_protect, quirks.skip_rt_write_record);
         Libraries::Np::NpTrophy::game_serial = id;
 
         const auto trophyDir =
