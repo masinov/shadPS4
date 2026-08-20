@@ -253,6 +253,10 @@ static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<bool> useIndirectDispatchClamp(true);
+// Image-side fault service. Correct but expensive: each service is a full GPU drain
+// (Scheduler::Finish) and the eligibility test walks guest backing under the memory manager's
+// lock, both on the fault path. Off until the drain can be moved off the render queue.
+static ConfigEntry<bool> useImageFaultService(false);
 // Quirk lifts: the per-title quirk table trades accuracy for speed (merged page watchers make
 // CPU reads of GPU data unobservable; disabled render sync leaves render-target writes
 // unrecorded). These force the accurate paths back on for titles the table degrades.
@@ -633,6 +637,10 @@ bool getUseSparseBlockReclaim() {
 
 bool getUseIndirectDispatchClamp() {
     return useIndirectDispatchClamp.get();
+}
+
+bool getUseImageFaultService() {
+    return useImageFaultService.get();
 }
 
 bool getForceAccuratePageWatchers() {
@@ -1945,6 +1953,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useEvictionReadback.setFromToml(general, "useEvictionReadback", is_game_specific);
         useSparseBlockReclaim.setFromToml(general, "useSparseBlockReclaim", is_game_specific);
         useIndirectDispatchClamp.setFromToml(general, "useIndirectDispatchClamp", is_game_specific);
+        useImageFaultService.setFromToml(general, "useImageFaultService", is_game_specific);
         forceAccuratePageWatchers.setFromToml(general, "forceAccuratePageWatchers",
                                               is_game_specific);
         forceRenderSync.setFromToml(general, "forceRenderSync", is_game_specific);
@@ -2437,6 +2446,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["useEvictionReadback"] = useEvictionReadback.base_value;
         data["General"]["useSparseBlockReclaim"] = useSparseBlockReclaim.base_value;
         data["General"]["useIndirectDispatchClamp"] = useIndirectDispatchClamp.base_value;
+        data["General"]["useImageFaultService"] = useImageFaultService.base_value;
         data["General"]["forceAccuratePageWatchers"] = forceAccuratePageWatchers.base_value;
         data["General"]["forceRenderSync"] = forceRenderSync.base_value;
         data["General"]["memoryCompressionLevel"] = memoryCompressionLevel.base_value;
@@ -2833,6 +2843,7 @@ void setDefaultValues() {
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
     useIndirectDispatchClamp = true;
+    useImageFaultService = false;
     forceAccuratePageWatchers = false;
     forceRenderSync = false;
     memoryCompressionLevel = 0;

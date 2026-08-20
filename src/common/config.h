@@ -247,6 +247,7 @@ bool getUseSparseCacheBuffers();
 bool getUseEvictionReadback();
 bool getUseSparseBlockReclaim();
 bool getUseIndirectDispatchClamp();
+bool getUseImageFaultService();
 bool getForceAccuratePageWatchers();
 bool getForceRenderSync();
 void setUseSparseCacheBuffers(bool enable);

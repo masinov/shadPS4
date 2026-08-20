@@ -371,6 +371,15 @@ u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
             ++readback_stats.fault_aborted_dirty;
             continue;
         }
+        if (!IsReadbackViable(image_id, image)) {
+            ++readback_stats.fault_aborted_viability;
+            continue;
+        }
+        // Deliberately last: resolving a maybe reads guest backing through
+        // ForEachBackingChunk, which takes the memory manager's lock and allocates, on the fault
+        // path. Every cheaper rejection must happen before it - servicing runs on roughly a
+        // hundred thousand faults a session and hashing images that are then rejected anyway is
+        // pure loss (that ordering, shipped in the previous build, is what cost the framerate).
         if (True(image.flags & ImageFlagBits::MaybeCpuDirty)) {
             // Resolve the maybe: if guest content still hashes to what it was when tracking was
             // dropped, no guest write landed on the image and the device copy is authoritative.
@@ -383,10 +392,6 @@ u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
                 continue;
             }
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
-        }
-        if (!IsReadbackViable(image_id, image)) {
-            ++readback_stats.fault_aborted_viability;
-            continue;
         }
         DownloadImageMemory(image_id, true);
         image.flags &= ~ImageFlagBits::GpuModified;

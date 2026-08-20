@@ -226,7 +226,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         // both claim the faulted pages: render-target and storage-image writes never reach the
         // cached buffer, so for those ranges the bytes the buffer download just planted are
         // stale - the mode-3 flashing-texture mechanism.
-        texture_cache.ServiceFaultRange(device_addr, size);
+        if (Config::getUseImageFaultService()) {
+            texture_cache.ServiceFaultRange(device_addr, size);
+        }
     });
 }
 
