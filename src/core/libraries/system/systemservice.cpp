@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include "common/config.h"
+#include "common/logging/backend.h"
 
 #include "common/elf_info.h"
 #include "common/singleton.h"
@@ -1875,12 +1876,19 @@ int PS4_SYSV_ABI sceSystemServiceLaunchWebBrowser() {
 }
 
 int PS4_SYSV_ABI sceSystemServiceLoadExec(const char* path, const char* argv[]) {
-    LOG_DEBUG(Lib_SystemService, "called");
+    // Guest-initiated relaunch - games call this from their own fatal-error handlers, so this
+    // line is frequently the last meaningful event of a session. Run 70's "the game restarted
+    // by itself" was this path; the silent-death class (runs 35, 64, 68: no dump, log truncated
+    // mid-write) matches the quick_exit branch below, which killed the process before the log
+    // queue drained. Log loudly and STOP THE LOG BACKEND (drains the queue to disk) before any
+    // exit or relaunch, so the event always survives.
+    LOG_WARNING(Lib_SystemService, "Guest requested LoadExec: path='{}'", path);
     auto emu = Common::Singleton<Core::Emulator>::Instance();
     auto mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     // Validate through the mount stack so archive-backed targets resolve.
     if (!mnt->Exists(std::string_view(path))) {
-        LOG_INFO(Lib_SystemService, "Restart called with invalid file '{}', exiting.", path);
+        LOG_CRITICAL(Lib_SystemService, "LoadExec target '{}' does not resolve; exiting.", path);
+        Common::Log::Stop();
         std::quick_exit(0);
     }
     std::filesystem::path exec_path;
@@ -1899,6 +1907,9 @@ int PS4_SYSV_ABI sceSystemServiceLoadExec(const char* path, const char* argv[]) 
             args.push_back(std::string(*ptr));
         }
     }
+    LOG_WARNING(Lib_SystemService, "LoadExec relaunching '{}' with {} args",
+                fmt::UTF(exec_path.u8string()), args.size());
+    Common::Log::Stop();
     emu->Restart(exec_path, args);
     return ORBIS_OK;
 }
