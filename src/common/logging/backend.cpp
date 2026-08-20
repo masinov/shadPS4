@@ -143,6 +143,17 @@ public:
         Filter filter;
         filter.ParseFilterString(Config::getLogFilter());
         const auto& log_file_path = log_file.empty() ? LOG_FILE : log_file;
+        // Never destroy the previous session's log: an in-place relaunch (run 70 lost a
+        // 40-minute session log to one) rotates the old file aside instead of truncating it.
+        const auto current = log_dir / log_file_path;
+        std::error_code ec;
+        if (std::filesystem::exists(current, ec)) {
+            std::filesystem::rename(current,
+                                    log_dir /
+                                        (std::string(".previous.") +
+                                         std::filesystem::path(log_file_path).filename().string()),
+                                    ec);
+        }
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(
             new Impl(log_dir / log_file_path, filter), Deleter);
         initialization_in_progress_suppress_logging = false;

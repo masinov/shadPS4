@@ -4,6 +4,7 @@
 #include <atomic>
 #include <csignal>
 #include <exception>
+#include <intrin.h>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -185,13 +186,43 @@ static LONG WINAPI UnhandledCrashFilter(EXCEPTION_POINTERS* pointers) {
 }
 
 // Runs 35 and 64 died with no dump, no WER entry and a log truncated mid-write: paths through
-// std::terminate / abort / fastfail bypass SetUnhandledExceptionFilter entirely. Raising a
-// software exception from the terminate handler routes those deaths through the same filter and
-// produces the same crash.dmp.
+// std::terminate / abort / fastfail bypass SetUnhandledExceptionFilter entirely. The first
+// version of this handler raised a software exception to reach the filter - a mistake: a raised
+// exception travels through every vectored and frame handler first, and in run 70 something en
+// route claimed it, so the process kept EXECUTING from a dying state (the game "restarted" to
+// its menu and the relaunch truncated the session log). The handler now writes the dump
+// directly with a captured context and terminates immediately; nothing can intercept it.
 [[noreturn]] static void TerminateDumpHandler() {
-    RaiseException(0xE000DEADu, 0, 0, nullptr);
-    // RaiseException returns if a handler continued execution; nothing sane remains.
-    ExitProcess(0xE000DEADu);
+    static std::atomic_flag dumping = ATOMIC_FLAG_INIT;
+    if (!dumping.test_and_set()) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        RtlCaptureContext(&context);
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = 0xE000DEADu;
+        record.ExceptionAddress = _ReturnAddress();
+        EXCEPTION_POINTERS pointers{
+            .ExceptionRecord = &record,
+            .ContextRecord = &context,
+        };
+        const auto dump_path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "crash.dmp";
+        const HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            MINIDUMP_EXCEPTION_INFORMATION info{
+                .ThreadId = GetCurrentThreadId(),
+                .ExceptionPointers = &pointers,
+                .ClientPointers = FALSE,
+            };
+            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                              static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory |
+                                                         MiniDumpScanMemory),
+                              &info, nullptr, nullptr);
+            CloseHandle(file);
+        }
+    }
+    TerminateProcess(GetCurrentProcess(), 0xE000DEADu);
+    ExitProcess(0xE000DEADu); // unreachable; satisfies [[noreturn]] analysis
 }
 #endif
 
