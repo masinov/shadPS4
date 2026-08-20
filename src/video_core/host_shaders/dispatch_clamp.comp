@@ -3,12 +3,19 @@
 
 #version 450
 
-// Clamps indirect dispatch arguments to the device's group-count limit at execution time.
-// The arguments live in a GPU-written guest buffer, so no CPU-side validation can see the
-// values the dispatch will actually consume; garbage values hang the device (TDRs on the
-// indirect-dispatch pipelines across revs 28, 31B, 33, 49, 59 and 63). Sane arguments pass
-// through byte-identical; insane ones are clamped and counted so the event is loud instead
-// of fatal.
+// Validates indirect dispatch arguments at execution time. The arguments live in a
+// GPU-written guest buffer, so no CPU-side validation can see the values the dispatch will
+// actually consume; garbage values hang the device (TDRs on the indirect-dispatch pipelines
+// across revs 28, 31B, 33, 49, 59 and 63).
+//
+// Out-of-range arguments zero the dispatch instead of being clamped to the limit. Clamping
+// per dimension was a mistake in the original version of this shader: run 73 observed real
+// garbage arguments (1141305 x 409600024 x 3439330304), and min()-ing those against the
+// limit yields 65535 x 65535 x 65535 - 2.8e14 workgroups, which is not a rescue but a
+// guaranteed permanent hang, precisely the failure the guard exists to prevent. Any
+// dimension above the limit is already impossible on the real hardware, so the arguments are
+// corrupt by definition and the work they describe is garbage whatever it computes; running
+// none of it is strictly better than hanging the device. A zero dispatch is a legal no-op.
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -32,10 +39,11 @@ void main() {
     const uint x = src_args[0];
     const uint y = src_args[1];
     const uint z = src_args[2];
-    dst_args[0] = min(x, pc.max_groups);
-    dst_args[1] = min(y, pc.max_groups);
-    dst_args[2] = min(z, pc.max_groups);
-    if (x > pc.max_groups || y > pc.max_groups || z > pc.max_groups) {
+    const bool insane = x > pc.max_groups || y > pc.max_groups || z > pc.max_groups;
+    dst_args[0] = insane ? 0u : x;
+    dst_args[1] = insane ? 0u : y;
+    dst_args[2] = insane ? 0u : z;
+    if (insane) {
         atomicAdd(clamp_count, 1u);
     }
 }

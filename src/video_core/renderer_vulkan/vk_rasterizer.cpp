@@ -496,9 +496,33 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     std::memcpy(record_groups.data(), reinterpret_cast<const void*>(address + offset),
                 std::min<size_t>(sizeof(record_groups), size));
     constexpr u32 MaxSaneGroups = 65535; // PS4 dispatch dimension limit
-    if (record_groups[0] > MaxSaneGroups || record_groups[1] > MaxSaneGroups ||
-        record_groups[2] > MaxSaneGroups ||
-        VideoCore::ShouldLogDiagnosticSample(++indirect_dispatch_log_count)) {
+    const bool record_insane = record_groups[0] > MaxSaneGroups ||
+                               record_groups[1] > MaxSaneGroups || record_groups[2] > MaxSaneGroups;
+    if (record_insane) {
+        // Guest memory holding garbage where dispatch arguments belong is the first direct
+        // capture of the corruption this project has been chasing (run 73, t=830.68). Dump the
+        // surrounding bytes: if they read as foreign data rather than noise, they identify what
+        // overwrote them. Costs nothing - this branch has fired exactly once in 19 sessions.
+        std::array<u8, 64> window{};
+        const VAddr window_addr = address + offset;
+        std::memcpy(window.data(), reinterpret_cast<const void*>(window_addr),
+                    std::min<size_t>(window.size(), size));
+        std::string hex;
+        hex.reserve(window.size() * 3);
+        for (size_t i = 0; i < window.size(); ++i) {
+            hex += fmt::format("{:02x}{}", window[i], (i % 16 == 15) ? " | " : " ");
+        }
+        const auto page_state = buffer_cache.GetDebugPageState(window_addr);
+        LOG_ERROR(Render_Vulkan,
+                  "Indirect dispatch arguments are corrupt: addr={:#x}, groups={}x{}x{}, "
+                  "generation={}, buffer=[{:#x},{:#x}) registered={} cpu_modified={} "
+                  "gpu_modified={} gpu_pending={}; bytes: {}",
+                  window_addr, record_groups[0], record_groups[1], record_groups[2],
+                  buffer->address_generation, page_state.buffer_begin, page_state.buffer_end,
+                  page_state.registered, page_state.cpu_modified, page_state.gpu_modified,
+                  page_state.gpu_pending, hex);
+    }
+    if (record_insane || VideoCore::ShouldLogDiagnosticSample(++indirect_dispatch_log_count)) {
         LOG_INFO(Render_Vulkan,
                  "Indirect dispatch: args_addr={:#x}, record_groups={}x{}x{}, on_gpu={}, "
                  "generation={}, sane={}",
@@ -696,6 +720,18 @@ void Rasterizer::ReclaimForAllocation(u64 reclaim_target, u64 allocation_size, b
 }
 
 void Rasterizer::OnSubmit() {
+    // Report a guard event the moment it becomes visible rather than at the next statistics
+    // interval. Run 73's corrupt dispatch was never covered by a clamp reading at all: the last
+    // one printed 21 seconds earlier and the session died 275 ms after the dispatch, so whether
+    // the guard fired on it is simply unknown - and a zero read at that distance was taken as
+    // evidence that it had not. Four bytes per submit buys a timestamped answer.
+    if (const u32 guard_skips = dispatch_guard.ClampCount(); guard_skips != last_guard_skips) {
+        LOG_ERROR(Render_Vulkan,
+                  "Indirect dispatch guard: skipped {} insane dispatch(es) this interval, {} "
+                  "total - the arguments the GPU read were out of range",
+                  guard_skips - last_guard_skips, guard_skips);
+        last_guard_skips = guard_skips;
+    }
     instance.SetMemoryAllocatorFrameIndex(++memory_allocator_frame_index);
     // Eviction age is counted in guest submissions, independently of how many collector passes
     // allocation preflight ran in between.
@@ -841,7 +877,7 @@ void Rasterizer::OnSubmit() {
                 cache_stats.fault_serviced_empty, cache_stats.uploads,
                 cache_stats.upload_bytes / 1_MB, cache_stats.overlap_uploads,
                 cache_stats.overlap_upload_pages, used_memory / 1_MB);
-            LOG_INFO(Render_Vulkan, "Indirect dispatch clamp: clamped={}",
+            LOG_INFO(Render_Vulkan, "Indirect dispatch guard: insane_skipped={}",
                      dispatch_guard.ClampCount());
             LOG_INFO(Render_Vulkan,
                      "Sparse reclaim ghosts: hits={} ({} MiB), live={}, limbo={} MiB, "

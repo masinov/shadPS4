@@ -253,10 +253,12 @@ static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<bool> useIndirectDispatchClamp(true);
-// Image-side fault service. Correct but expensive: each service is a full GPU drain
-// (Scheduler::Finish) and the eligibility test walks guest backing under the memory manager's
-// lock, both on the fault path. Off until the drain can be moved off the render queue.
-static ConfigEntry<bool> useImageFaultService(false);
+// Image-side fault service. Defaulted off for one build on a misattributed regression: the
+// half-framerate session that prompted it was the accuracy experiment (233 read faults per
+// second), not this service, which ran seventeen times in that entire session. Back on, with
+// the predicate ordering that build also fixed. Its cost at stock quirks has still never been
+// measured, and the toggle stays so it can be.
+static ConfigEntry<bool> useImageFaultService(true);
 // Quirk lifts: the per-title quirk table trades accuracy for speed (merged page watchers make
 // CPU reads of GPU data unobservable; disabled render sync leaves render-target writes
 // unrecorded). These force the accurate paths back on for titles the table degrades.
@@ -2843,7 +2845,7 @@ void setDefaultValues() {
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
     useIndirectDispatchClamp = true;
-    useImageFaultService = false;
+    useImageFaultService = true;
     forceAccuratePageWatchers = false;
     forceRenderSync = false;
     memoryCompressionLevel = 0;
