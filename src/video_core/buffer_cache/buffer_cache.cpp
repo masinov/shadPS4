@@ -1416,10 +1416,93 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .pBufferMemoryBarriers = &post_barrier,
         });
     }
+    if (!src_buffer && !is_written) {
+        // Nothing was uploaded, so the tracker considers this range clean on the CPU side. If it
+        // is also clean on the GPU side, the device copy and guest memory must be identical -
+        // and if they are not, nothing will ever notice, because no dirty bit exists to trigger
+        // a repair. That is precisely the shape of a defect that corrupts one asset and stays
+        // until the asset is streamed again. Sampled: one comparison per 4096 synchronizations.
+        if (Config::getUseContentValidator() && (++content_check_cursor & 0xFFF) == 0) {
+            ValidateBufferAgainstGuest(buffer, device_addr, size);
+        }
+    }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
     }
     return false;
+}
+
+void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, u32 size) {
+    static constexpr u32 MaxCompare = 4096;
+    const u32 compare_size = std::min(size, MaxCompare);
+    if (compare_size == 0 || !buffer.IsInBounds(device_addr, compare_size)) {
+        return;
+    }
+    const u64 buffer_offset = buffer.Offset(device_addr);
+    if (!buffer.IsRangeBound(buffer_offset, compare_size)) {
+        return; // sparse reserve page; nothing is meant to be there
+    }
+    if (memory_tracker->IsRegionGpuModified(device_addr, compare_size)) {
+        return; // device copy is legitimately ahead of guest memory
+    }
+
+    const auto [mapped, download_offset] = download_buffer.Map(compare_size);
+    if (!mapped) {
+        return;
+    }
+    download_buffer.Commit();
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = buffer.Handle(),
+        .offset = buffer_offset,
+        .size = compare_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(),
+                      vk::BufferCopy{.srcOffset = buffer_offset,
+                                     .dstOffset = download_offset,
+                                     .size = compare_size});
+    scheduler.Finish();
+
+    std::vector<u8> guest_bytes(compare_size);
+    memory->CopySparseMemory(device_addr, guest_bytes.data(), compare_size);
+    ++stats.content_checks;
+    if (std::memcmp(guest_bytes.data(), mapped, compare_size) == 0) {
+        return;
+    }
+
+    u32 first = 0;
+    while (first < compare_size && guest_bytes[first] == mapped[first]) {
+        ++first;
+    }
+    u32 differing = 0;
+    for (u32 i = first; i < compare_size; ++i) {
+        differing += guest_bytes[i] != mapped[i] ? 1 : 0;
+    }
+    const u32 dump_at = first & ~15u;
+    const u32 dump_len = std::min<u32>(32, compare_size - dump_at);
+    std::string guest_hex, device_hex;
+    for (u32 i = 0; i < dump_len; ++i) {
+        guest_hex += fmt::format("{:02x} ", guest_bytes[dump_at + i]);
+        device_hex += fmt::format("{:02x} ", mapped[dump_at + i]);
+    }
+    ++stats.content_mismatches;
+    LOG_ERROR(Render_Vulkan,
+              "Silent cache divergence: addr={:#x}, compared={} bytes, first_diff=+{:#x}, "
+              "differing={} bytes, buffer=[{:#x},{:#x}) generation={}; guest[{:#x}]: {}; "
+              "device[{:#x}]: {}",
+              device_addr, compare_size, first, differing, buffer.CpuAddr(),
+              buffer.CpuAddr() + buffer.SizeBytes(), buffer.address_generation,
+              device_addr + dump_at, guest_hex, device_addr + dump_at, device_hex);
 }
 
 vk::Buffer BufferCache::UploadCopies(const Buffer& buffer, std::span<vk::BufferCopy> copies,

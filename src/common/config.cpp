@@ -253,6 +253,9 @@ static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<bool> useIndirectDispatchClamp(true);
+// Samples the device-copy-equals-guest-memory invariant on ranges both caches call clean. One
+// comparison per 4096 synchronizations - a small download and drain every few seconds.
+static ConfigEntry<bool> useContentValidator(true);
 // Image-side fault service. Defaulted off for one build on a misattributed regression: the
 // half-framerate session that prompted it was the accuracy experiment (233 read faults per
 // second), not this service, which ran seventeen times in that entire session. Back on, with
@@ -639,6 +642,10 @@ bool getUseSparseBlockReclaim() {
 
 bool getUseIndirectDispatchClamp() {
     return useIndirectDispatchClamp.get();
+}
+
+bool getUseContentValidator() {
+    return useContentValidator.get();
 }
 
 bool getUseImageFaultService() {
@@ -1955,6 +1962,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useEvictionReadback.setFromToml(general, "useEvictionReadback", is_game_specific);
         useSparseBlockReclaim.setFromToml(general, "useSparseBlockReclaim", is_game_specific);
         useIndirectDispatchClamp.setFromToml(general, "useIndirectDispatchClamp", is_game_specific);
+        useContentValidator.setFromToml(general, "useContentValidator", is_game_specific);
         useImageFaultService.setFromToml(general, "useImageFaultService", is_game_specific);
         forceAccuratePageWatchers.setFromToml(general, "forceAccuratePageWatchers",
                                               is_game_specific);
@@ -2448,6 +2456,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["useEvictionReadback"] = useEvictionReadback.base_value;
         data["General"]["useSparseBlockReclaim"] = useSparseBlockReclaim.base_value;
         data["General"]["useIndirectDispatchClamp"] = useIndirectDispatchClamp.base_value;
+        data["General"]["useContentValidator"] = useContentValidator.base_value;
         data["General"]["useImageFaultService"] = useImageFaultService.base_value;
         data["General"]["forceAccuratePageWatchers"] = forceAccuratePageWatchers.base_value;
         data["General"]["forceRenderSync"] = forceRenderSync.base_value;
@@ -2845,6 +2854,7 @@ void setDefaultValues() {
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
     useIndirectDispatchClamp = true;
+    useContentValidator = true;
     useImageFaultService = true;
     forceAccuratePageWatchers = false;
     forceRenderSync = false;

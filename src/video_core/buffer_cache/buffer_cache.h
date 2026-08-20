@@ -267,7 +267,9 @@ public:
         u64 fault_readback_bytes{};    ///< bytes actually written back by download services
         u64 fault_serviced_empty{};
         u64 uploads{}; ///< guest->device synchronization copies (the true load-pressure gauge)
-        u64 overlap_uploads{}; ///< uploads that carried a CPU-dirty AND GPU-modified page
+        u64 content_checks{};     ///< device-vs-guest comparisons performed
+        u64 content_mismatches{}; ///< ranges the tracker called clean that had diverged
+        u64 overlap_uploads{};    ///< uploads that carried a CPU-dirty AND GPU-modified page
         u64 overlap_upload_pages{};
         u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
                                    ///< transition still completed
@@ -323,6 +325,13 @@ private:
 
     /// Writes device addresses for [offset, offset + size) of the buffer into the BDA page table.
     void WriteBdaEntries(const Buffer& buffer, u64 offset, u64 size);
+
+    /// Samples the invariant that a range both caches consider clean is byte-identical in the
+    /// device buffer and in guest memory. A divergence here is corruption that nothing will ever
+    /// repair, because no dirty bit is set to trigger a re-upload.
+    void ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, u32 size);
+
+    u64 content_check_cursor{};
 
     /// Sparse buffers: binds memory for a range about to be accessed and publishes its BDA.
     void EnsureRangeBound(Buffer& buffer, VAddr device_addr, u64 size);
