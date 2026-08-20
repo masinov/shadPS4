@@ -336,6 +336,64 @@ void TextureCache::ApplyReadyReadbacks() {
     }
 }
 
+u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
+    // The CPU faulted on [addr, addr+size) and the buffer cache has already written its bytes
+    // back to guest memory. Render-target and storage-image writes never reach the cached
+    // buffer, so for image-authored ranges those bytes are stale; download the image's texels
+    // over them. Every guard here is a lesson the eviction-readback flow already paid for:
+    // dirty aborts (run 35), viability/dominance (runs 36-38), alias conversion (run 38).
+    std::scoped_lock lock{mutex};
+    boost::container::small_vector<ImageId, 4> candidates;
+    ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            candidates.push_back(image_id);
+        }
+    });
+    u32 serviced = 0;
+    for (const ImageId image_id : candidates) {
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Registered) ||
+            False(image.flags & ImageFlagBits::GpuModified)) {
+            continue; // converted by a dominant image serviced earlier in this loop
+        }
+        // A CPU-dirty image means guest RAM holds newer bytes for part of the range; writing
+        // the GPU copy over them would destroy a guest write. Leave the range to the buffer
+        // service's result and count the abstention.
+        if (True(image.flags & ImageFlagBits::Dirty)) {
+            ++readback_stats.fault_aborted_dirty;
+            continue;
+        }
+        if (!IsReadbackViable(image_id, image)) {
+            ++readback_stats.fault_aborted_viability;
+            continue;
+        }
+        DownloadImageMemory(image_id, true);
+        image.flags &= ~ImageFlagBits::GpuModified;
+        buffer_cache.MarkRegionAsFlushed(image.info.guest_address, image.info.guest_size);
+        u32 converted = 0;
+        ForEachImageInRegion(
+            image.info.guest_address, image.info.guest_size, [&](ImageId other_id, Image& other) {
+                if (other_id == image_id || False(other.flags & ImageFlagBits::GpuModified)) {
+                    return;
+                }
+                other.flags &= ~ImageFlagBits::GpuModified;
+                ++converted;
+            });
+        readback_stats.converted_aliases += converted;
+        ++readback_stats.fault_services;
+        ++serviced;
+        if (readback_stats.fault_services <= 16 ||
+            (readback_stats.fault_services & (readback_stats.fault_services - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Image fault service: image={}, addr={:#x}, size={:#x}, format={}, "
+                     "fault_addr={:#x} (event #{})",
+                     image_id.index, image.info.guest_address, image.info.guest_size,
+                     vk::to_string(image.info.pixel_format), addr, readback_stats.fault_services);
+        }
+    }
+    return serviced;
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash

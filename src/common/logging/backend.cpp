@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <mutex>
 #include <thread>
@@ -145,14 +146,25 @@ public:
         const auto& log_file_path = log_file.empty() ? LOG_FILE : log_file;
         // Never destroy the previous session's log: an in-place relaunch (run 70 lost a
         // 40-minute session log to one) rotates the old file aside instead of truncating it.
+        // Timestamped names so a double relaunch cannot overwrite the first preserved log
+        // either; old rotations accumulate and can be pruned freely.
         const auto current = log_dir / log_file_path;
         std::error_code ec;
         if (std::filesystem::exists(current, ec)) {
-            std::filesystem::rename(current,
-                                    log_dir /
-                                        (std::string(".previous.") +
-                                         std::filesystem::path(log_file_path).filename().string()),
-                                    ec);
+            const std::time_t now = std::time(nullptr);
+            std::tm tm_buf{};
+#ifdef _WIN32
+            localtime_s(&tm_buf, &now);
+#else
+            localtime_r(&now, &tm_buf);
+#endif
+            char stamp[32];
+            (void)std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_buf);
+            std::filesystem::rename(
+                current,
+                log_dir / fmt::format(".previous-{}.{}", stamp,
+                                      std::filesystem::path(log_file_path).filename().string()),
+                ec);
         }
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(
             new Impl(log_dir / log_file_path, filter), Deleter);

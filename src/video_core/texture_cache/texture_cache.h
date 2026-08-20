@@ -133,6 +133,11 @@ private:
     bool IsReadbackViable(ImageId image_id, Image& image);
 
 public:
+    /// Fault-service twin of the eviction readback: writes the texels of GPU-modified images
+    /// overlapping [addr, addr+size) into guest memory. Called by the buffer cache after its own
+    /// download so image bytes win wherever both claim a page. Returns images serviced.
+    u32 ServiceFaultRange(VAddr addr, u64 size);
+
     /// Add an image to the download queue for guest memory writeback on next submit.
     void AddDownload(ImageId image_id) {
         std::unique_lock lk{download_images_mutex};
@@ -380,6 +385,9 @@ public:
         u64 converted_aliases{};
         u64 aborted_record_state{};
         u64 aborted_no_staging{};
+        u64 fault_services{};
+        u64 fault_aborted_dirty{};
+        u64 fault_aborted_viability{};
     };
 
     [[nodiscard]] ReadbackStats GetReadbackStats() const noexcept {

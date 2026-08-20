@@ -185,6 +185,26 @@ public:
         }
     }
 
+    /// Number of pages in the query range that are simultaneously CPU-dirty and GPU-modified -
+    /// the collision state in which neither side's bytes can be reconciled losslessly at page
+    /// granularity. Lock must be held by the caller.
+    [[nodiscard]] u64 CountCpuGpuOverlapPages(VAddr query_cpu_range, s64 size) noexcept {
+        const size_t offset = query_cpu_range - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return 0;
+        }
+        RegionBits mask(cpu, start_page, end_page);
+        mask &= gpu;
+        u64 pages = 0;
+        for (const auto& [start, end] : mask) {
+            pages += end - start;
+        }
+        return pages;
+    }
+
     /**
      * Returns true when a region has been modified
      *

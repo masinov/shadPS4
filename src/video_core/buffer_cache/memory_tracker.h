@@ -60,6 +60,17 @@ public:
             });
     }
 
+    /// Sum of pages that are simultaneously CPU-dirty and GPU-modified across the range.
+    u64 GetCpuGpuOverlapPages(VAddr query_cpu_addr, u64 query_size) noexcept {
+        u64 pages = 0;
+        IteratePages<false>(
+            query_cpu_addr, query_size, [&pages](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
+                pages += manager->CountCpuGpuOverlapPages(manager->GetCpuAddr() + offset, size);
+            });
+        return pages;
+    }
+
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<false>(dirty_cpu_addr, query_size,

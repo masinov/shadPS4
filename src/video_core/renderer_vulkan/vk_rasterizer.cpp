@@ -802,7 +802,7 @@ void Rasterizer::OnSubmit() {
 
         // Cheap cumulative view of the buffer cache: replacement kinds and, for sparse buffers,
         // demand binding volume and total bound bytes. Sampled so it stays a few lines per minute.
-        if (++cache_stats_log_count >= 30) {
+        if (++cache_stats_log_count >= 8) {
             cache_stats_log_count = 0;
             const auto cache_stats = buffer_cache.GetStatistics();
             const auto sparse_stats = scheduler.GetSparseBindStatistics();
@@ -810,11 +810,14 @@ void Rasterizer::OnSubmit() {
             LOG_INFO(Render_Vulkan,
                      "Eviction readback: nominated={}, applied={}, aborted_dirty={}, "
                      "aborted_reused={}, aborted_buffer_alias={}, aborted_image_alias={}, "
-                     "converted_aliases={}, aborted_record_state={}, aborted_no_staging={}",
+                     "converted_aliases={}, aborted_record_state={}, aborted_no_staging={}, "
+                     "fault_services={}, fault_aborted_dirty={}, fault_aborted_viability={}",
                      readback_stats.nominated, readback_stats.applied, readback_stats.aborted_dirty,
                      readback_stats.aborted_reused, readback_stats.aborted_buffer_alias,
                      readback_stats.aborted_image_alias, readback_stats.converted_aliases,
-                     readback_stats.aborted_record_state, readback_stats.aborted_no_staging);
+                     readback_stats.aborted_record_state, readback_stats.aborted_no_staging,
+                     readback_stats.fault_services, readback_stats.fault_aborted_dirty,
+                     readback_stats.fault_aborted_viability);
             LOG_INFO(
                 Render_Vulkan,
                 "Buffer cache: live={}, bound={} MiB, replacements={} (new={}, grow={}, "
@@ -822,7 +825,7 @@ void Rasterizer::OnSubmit() {
                 "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB, age={}), "
                 "stale_hints={}, vertex_misses={}, takeover_mismatches={}, "
                 "fault_readbacks={}r/{}w ({} MiB, empty={}), uploads={} ({} MiB), "
-                "usage={} MiB",
+                "overlap={}x ({} pages), usage={} MiB",
                 cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB, cache_stats.replacements,
                 cache_stats.replacements_new, cache_stats.replacements_grow,
                 cache_stats.replacements_bridge, cache_stats.replaced_bytes / 1_MB,
@@ -834,7 +837,8 @@ void Rasterizer::OnSubmit() {
                 cache_stats.takeover_mismatches, cache_stats.fault_readbacks_read,
                 cache_stats.fault_readbacks_write, cache_stats.fault_readback_bytes / 1_MB,
                 cache_stats.fault_serviced_empty, cache_stats.uploads,
-                cache_stats.upload_bytes / 1_MB, used_memory / 1_MB);
+                cache_stats.upload_bytes / 1_MB, cache_stats.overlap_uploads,
+                cache_stats.overlap_upload_pages, used_memory / 1_MB);
             LOG_INFO(Render_Vulkan, "Indirect dispatch clamp: clamped={}",
                      dispatch_guard.ClampCount());
             LOG_INFO(Render_Vulkan,
@@ -1646,11 +1650,6 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
-    // Mapping events cluster at area transitions (a teleport is a burst of these), which is when
-    // the geometry corruption strikes. With line timestamps they anchor the timeline every
-    // explosion report gets joined against.
-    LOG_INFO(Render_Vulkan, "GPU memory mapped: [{:#x},{:#x}) ({} KiB)", addr, addr + size,
-             size / 1024);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -1659,8 +1658,6 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
-    LOG_INFO(Render_Vulkan, "GPU memory unmapped: [{:#x},{:#x}) ({} KiB)", addr, addr + size,
-             size / 1024);
     buffer_cache.InvalidateMemory(addr, size, true);
     texture_cache.UnmapMemory(addr, size);
     page_manager.OnGpuUnmap(addr, size);

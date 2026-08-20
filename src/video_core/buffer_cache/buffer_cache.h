@@ -266,9 +266,11 @@ public:
         u64 fault_readbacks_write{};   ///< armed-protection services triggered by CPU writes
         u64 fault_readback_bytes{};    ///< bytes actually written back by download services
         u64 fault_serviced_empty{};
-        u64 uploads{};      ///< guest->device synchronization copies (the true load-pressure gauge)
-        u64 upload_bytes{}; ///< services that found no tracker data (raced) - state
-                            ///< transition still completed
+        u64 uploads{}; ///< guest->device synchronization copies (the true load-pressure gauge)
+        u64 overlap_uploads{}; ///< uploads that carried a CPU-dirty AND GPU-modified page
+        u64 overlap_upload_pages{};
+        u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
+                                   ///< transition still completed
         u64 takeover_mismatches{}; ///< sparse merges where taken bytes != absorbed bytes
         u64 replacements_new{};    ///< ... with no overlap
         u64 replacements_grow{};   ///< ... with exactly one overlap

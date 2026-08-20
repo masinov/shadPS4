@@ -133,6 +133,27 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         download_buffer.Commit();
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
+        // The bytes being saved may be produced by GPU work recorded earlier in this same batch
+        // (compute skinning writes into the very buffers the game then CPU-touches). Without this
+        // barrier the transfer read is not ordered against those writes - scheduler.Finish()
+        // below waits for completion but cannot reorder within the command buffer - so the
+        // service could download stale or torn data and plant it in guest memory, where the next
+        // upload feeds it back to the GPU. CopyBuffer and SynchronizeBuffer both carry the
+        // equivalent barrier; this path was recorded bare.
+        const vk::BufferMemoryBarrier2 download_pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = buffer.Handle(),
+            .offset = 0,
+            .size = buffer.SizeBytes(),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &download_pre_barrier,
+        });
         instance.InsertCheckpoint(cmdbuf, Vulkan::GpuCheckpoint::BufferDownload,
                                   Vulkan::GpuCheckpointContext{
                                       .source_guest_address = device_addr,
@@ -140,6 +161,21 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                                       .source_generation = buffer.address_generation,
                                   });
         cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+        // WAR guard: later-recorded GPU writes to this buffer must not overtake the read.
+        const vk::BufferMemoryBarrier2 download_post_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .buffer = buffer.Handle(),
+            .offset = 0,
+            .size = buffer.SizeBytes(),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &download_post_barrier,
+        });
         const VAddr buffer_addr = buffer.CpuAddr();
         auto write_data = [this, copies = std::move(copies), download, offset, buffer_addr,
                            device_addr, size, is_write] {
@@ -186,6 +222,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
+        // Image-authored content second, so its texels overwrite the buffer's bytes wherever
+        // both claim the faulted pages: render-target and storage-image writes never reach the
+        // cached buffer, so for those ranges the bytes the buffer download just planted are
+        // stale - the mode-3 flashing-texture mechanism.
+        texture_cache.ServiceFaultRange(device_addr, size);
     });
 }
 
@@ -1301,6 +1342,25 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // important for direct-memory shaders, which dereference the BDA page table at execution time.
     MarkBufferUsed(buffer);
     EnsureRangeBound(buffer, device_addr, size);
+    // Collision probe: a page that is simultaneously CPU-dirty and GPU-modified is about to be
+    // re-uploaded from guest RAM, and RAM either never received the GPU-authored bytes
+    // (readback disabled) or holds a stale copy (service raced or failed). Neither side can be
+    // reconciled losslessly at page granularity, so this is corruption being fed to the GPU:
+    // the geometry-explosion mechanism. The fault service exists to keep the two states
+    // mutually exclusive - any nonzero count here measures the residual hole, and doubles as
+    // the feasibility gauge for pinning contested pages to host memory.
+    const u64 overlap_pages = memory_tracker->GetCpuGpuOverlapPages(device_addr, size);
+    if (overlap_pages != 0) {
+        ++stats.overlap_uploads;
+        stats.overlap_upload_pages += overlap_pages;
+        if (stats.overlap_uploads <= 16 ||
+            (stats.overlap_uploads & (stats.overlap_uploads - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "CPU/GPU collision at upload: addr={:#x}, size={:#x}, pages={}, "
+                        "written={} (event #{})",
+                        device_addr, size, overlap_pages, is_written, stats.overlap_uploads);
+        }
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
