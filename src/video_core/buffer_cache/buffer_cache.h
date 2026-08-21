@@ -267,9 +267,10 @@ public:
         u64 fault_readback_bytes{};    ///< bytes actually written back by download services
         u64 fault_serviced_empty{};
         u64 uploads{}; ///< guest->device synchronization copies (the true load-pressure gauge)
-        u64 content_checks{};     ///< device-vs-guest comparisons performed
-        u64 content_mismatches{}; ///< ranges the tracker called clean that had diverged
-        u64 overlap_uploads{};    ///< uploads that carried a CPU-dirty AND GPU-modified page
+        u64 preemptive_stale_rescues{}; ///< parked staging pointers invalidated by ring reuse
+        u64 content_checks{};           ///< device-vs-guest comparisons performed
+        u64 content_mismatches{};       ///< ranges the tracker called clean that had diverged
+        u64 overlap_uploads{};          ///< uploads that carried a CPU-dirty AND GPU-modified page
         u64 overlap_upload_pages{};
         u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
                                    ///< transition still completed
@@ -330,6 +331,10 @@ private:
     /// device buffer and in guest memory. A divergence here is corruption that nothing will ever
     /// repair, because no dirty bit is set to trigger a re-upload.
     void ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, u32 size);
+
+    /// Freshly downloads [device_addr, device_addr+size) from its cache buffer and writes it to
+    /// guest memory. Used when a parked preemptive staging pointer has gone stale.
+    void RedownloadToGuest(VAddr device_addr, u32 size);
 
     u64 content_check_cursor{};
 
@@ -409,6 +414,11 @@ private:
         u64 size;
         u8* staging;
         u64 done_tick;
+        /// Ring position of `staging` when it was parked. The pointer may only be dereferenced
+        /// while the download ring has not lapped past it; afterwards it aliases newer downloads
+        /// and writing it back would plant foreign bytes into guest memory - permanently, since
+        /// the tracker then treats the page as CPU-authoritative.
+        u64 ring_virtual;
 
         auto operator<=>(const PreemptiveDownload&) const = default;
     };

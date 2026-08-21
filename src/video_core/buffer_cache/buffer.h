@@ -536,9 +536,32 @@ private:
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;
+    /// Lap counter for the CPU-side lifetime cursor. The GPU side of ring reuse is protected by
+    /// the tick watches; a raw pointer HELD BY THE CPU across submits (a parked preemptive
+    /// download) is invisible to them, so its validity is checked against this cursor instead.
+    u64 virtual_lap{};
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
     u64 wait_bound{};
+
+public:
+    /// Monotonic position of the allocation cursor across laps. The physical region behind a
+    /// mapping that began at virtual position V starts being reused once the cursor passes
+    /// V + size_bytes, regardless of GPU ticks.
+    [[nodiscard]] u64 CurrentVirtual() const noexcept {
+        return virtual_lap * size_bytes + offset;
+    }
+
+    /// Virtual position of the mapping most recently returned by Map (valid until Commit).
+    [[nodiscard]] u64 MappingVirtualBegin() const noexcept {
+        return CurrentVirtual();
+    }
+
+    /// True when the region of a mapping that began at `virtual_begin` may have been handed to a
+    /// newer mapping - a raw pointer into it must no longer be dereferenced.
+    [[nodiscard]] bool IsRegionStale(u64 virtual_begin) const noexcept {
+        return CurrentVirtual() > virtual_begin + size_bytes;
+    }
 };
 
 class StreamBufferMapping {

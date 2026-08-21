@@ -863,7 +863,7 @@ void Rasterizer::OnSubmit() {
                 "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB, age={}), "
                 "stale_hints={}, vertex_misses={}, takeover_mismatches={}, "
                 "fault_readbacks={}r/{}w ({} MiB, empty={}), uploads={} ({} MiB), "
-                "overlap={}x ({} pages), content={}chk/{}bad, usage={} MiB",
+                "overlap={}x ({} pages), content={}chk/{}bad, stale_rescues={}, usage={} MiB",
                 cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB, cache_stats.replacements,
                 cache_stats.replacements_new, cache_stats.replacements_grow,
                 cache_stats.replacements_bridge, cache_stats.replaced_bytes / 1_MB,
@@ -877,7 +877,8 @@ void Rasterizer::OnSubmit() {
                 cache_stats.fault_serviced_empty, cache_stats.uploads,
                 cache_stats.upload_bytes / 1_MB, cache_stats.overlap_uploads,
                 cache_stats.overlap_upload_pages, cache_stats.content_checks,
-                cache_stats.content_mismatches, used_memory / 1_MB);
+                cache_stats.content_mismatches, cache_stats.preemptive_stale_rescues,
+                used_memory / 1_MB);
             LOG_INFO(Render_Vulkan, "Indirect dispatch guard: insane_skipped={}",
                      dispatch_guard.ClampCount());
             LOG_INFO(Render_Vulkan,

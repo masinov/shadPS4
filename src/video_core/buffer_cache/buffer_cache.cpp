@@ -113,7 +113,25 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
     const VAddr page_addr = PageManager::GetPageAddr(device_addr);
     auto* memory = Core::Memory::Instance();
-    if (preemptive_downloads.Intersects(page_addr, PageManager::PAGE_SIZE)) {
+    // A parked staging pointer is only meaningful while the download ring has not lapped past
+    // it; the tick watches protect GPU reuse, not a CPU-held pointer. If any intersecting entry
+    // has gone stale, ignore the whole batch and take the ordinary synchronous download below -
+    // it reads the cache buffer directly and is correct regardless of what the entries held.
+    bool preemptive_usable = preemptive_downloads.Intersects(page_addr, PageManager::PAGE_SIZE);
+    if (preemptive_usable) {
+        preemptive_downloads.ForEachInRange(
+            page_addr, PageManager::PAGE_SIZE,
+            [&](VAddr begin, VAddr end, const PreemptiveDownload& download) {
+                if (download_buffer.IsRegionStale(download.ring_virtual)) {
+                    preemptive_usable = false;
+                }
+            });
+        if (!preemptive_usable) {
+            ++stats.preemptive_stale_rescues;
+            preemptive_downloads.Subtract(page_addr, PageManager::PAGE_SIZE);
+        }
+    }
+    if (preemptive_usable) {
         preemptive_downloads.ForEachInRange(
             page_addr, PageManager::PAGE_SIZE,
             [&](VAddr begin, VAddr end, const PreemptiveDownload& download) {
@@ -1167,6 +1185,18 @@ void BufferCache::ProcessPreemptiveDownloads() {
         if (!scheduler.IsFree(download.done_tick)) {
             return false;
         }
+        if (download_buffer.IsRegionStale(download.ring_virtual)) {
+            // The ring lapped this entry while it waited for its tick (the GPU running behind is
+            // exactly when entries wait longest). The pointer now aliases a newer download;
+            // writing it back would plant foreign bytes in guest memory that nothing would ever
+            // repair. Under the fast-path watcher quirk this sweep is the only route by which
+            // CPU reads observe GPU data at all, so the range cannot simply be dropped either -
+            // fetch it fresh.
+            ++stats.preemptive_stale_rescues;
+            RedownloadToGuest(download.device_addr, static_cast<u32>(download.size));
+            processed_ranges.emplace_back(begin, end - begin);
+            return true;
+        }
         memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
                                 download.size);
 
@@ -1177,6 +1207,45 @@ void BufferCache::ProcessPreemptiveDownloads() {
     for (const auto& [addr, size] : processed_ranges) {
         preemptive_downloads.Subtract(addr, size);
     }
+}
+
+void BufferCache::RedownloadToGuest(VAddr device_addr, u32 size) {
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    const BufferId buffer_id = page_table[page].buffer_id;
+    if (!buffer_id || slot_buffers[buffer_id].is_deleted) {
+        return; // the owning buffer is gone; nothing authoritative remains to fetch
+    }
+    Buffer& buffer = slot_buffers[buffer_id];
+    if (!buffer.IsInBounds(device_addr, size) ||
+        !buffer.IsRangeBound(buffer.Offset(device_addr), size)) {
+        return;
+    }
+    const auto [mapped, offset] = download_buffer.Map(size);
+    if (!mapped) {
+        return;
+    }
+    download_buffer.Commit();
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = buffer.Handle(),
+        .offset = buffer.Offset(device_addr),
+        .size = size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(
+        buffer.buffer, download_buffer.Handle(),
+        vk::BufferCopy{.srcOffset = buffer.Offset(device_addr), .dstOffset = offset, .size = size});
+    scheduler.Finish();
+    Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), mapped, size);
 }
 
 void BufferCache::ProcessFaultBuffer() {
@@ -1615,6 +1684,7 @@ void BufferCache::CommitPendingGpuRanges() {
     if (!preemptive_copies.empty()) {
         const u64 done_tick = scheduler.CurrentTick();
         const auto [staging, offset] = download_buffer.Map(total_size_bytes);
+        const u64 mapping_virtual = download_buffer.MappingVirtualBegin();
         download_buffer.Commit();
         for (auto it = preemptive_copies.begin(); it != preemptive_copies.end(); ++it) {
             const BufferId buffer_id = it.key();
@@ -1628,7 +1698,7 @@ void BufferCache::CommitPendingGpuRanges() {
                                              .size = copy.size,
                                              .staging = staging + copy.dstOffset,
                                              .done_tick = done_tick,
-
+                                             .ring_virtual = mapping_virtual + copy.dstOffset,
                                          });
                 copy.dstOffset += offset;
             }
