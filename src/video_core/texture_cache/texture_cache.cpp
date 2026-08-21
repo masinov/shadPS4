@@ -421,11 +421,14 @@ u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
-    if (image.hash == 0) {
-        // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = HashGuestContent(image.info.guest_address, image.info.guest_size);
-    }
+    // Deliberately no hash initialization here. This runs from the CPU-write invalidation path,
+    // AFTER the guest's write has landed, so hashing now would mint a "clean" baseline from
+    // content the device copy has never received. With the same-domain comparison in
+    // RefreshImage, that baseline then matches on the next refresh and the upload is skipped -
+    // the image is frozen at its pre-write content forever. (Inherited init; harmless only while
+    // the old cross-domain comparison could never match, which hid it. Elevator regression,
+    // run 76.) A zero hash now means "no trusted baseline": RefreshImage uploads and only then
+    // records, and the fault-service gate already abstains on zero.
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
 }
@@ -1052,20 +1055,21 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
-        // An image is only MaybeCpuDirty when it fits inside a single page, so hashing all of it
-        // is cheap (<= 4 KiB). It must be ALL of it: MarkAsMaybeDirty records the hash over the
-        // full guest_size, and this comparison used the first 64 pixels only. The two hash
-        // domains can never agree, so the early-out below never fired on a first check (every
-        // maybe-dirty image paid a full re-upload) - and worse, once a partial hash had been
-        // stored here, an image whose first 64 pixels were untouched but whose later bytes the
-        // guest had rewritten would certify as clean and skip the upload that would have brought
-        // those bytes in. Same-domain hashing fixes both directions.
+        // An image is only MaybeCpuDirty when it fits inside a single page, so hashing all of
+        // it is cheap (<= 4 KiB), and it must be ALL of it - a partial hash could certify
+        // "unmodified" while later bytes differ. The baseline is recorded exclusively below, on
+        // the upload path, where guest and device content become identical; nothing else may
+        // mint one (initializing it from post-write content froze small images at their
+        // pre-write state - the run 76 elevator regression).
         const u64 hash = HashGuestContent(image.info.guest_address, image.info.guest_size);
-        if (image.hash == hash) {
+        if (image.hash != 0 && image.hash == hash) {
+            // Matching a TRUSTED baseline - one recorded on an upload path, when guest and
+            // device content were identical - proves no guest write landed. A zero hash is not
+            // a baseline and must never certify cleanliness.
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
         }
-        image.hash = hash;
+        image.hash = hash; // becomes trusted via the upload that follows
     }
 
     const u32 num_layers = image.info.resources.layers;
