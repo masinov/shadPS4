@@ -1502,7 +1502,16 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
 }
 
 void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, u32 size) {
+    // Run 77 lesson: the first version of this check ended in scheduler.Finish() - a full GPU
+    // drain on the command processor, ~21 times per second at this sampling rate. That halved
+    // the frame rate (the game drops into slow motion below 30 fps) and destabilised
+    // moving-platform physics (elevator vibration, then clip-through). An instrument must not
+    // cost what it measures: snapshot guest memory now, queue the device copy, and compare when
+    // the tick retires on its own. Nothing in this path waits on the GPU.
     static constexpr u32 MaxCompare = 4096;
+    static constexpr size_t MaxPending = 32;
+    ResolveContentChecks();
+
     const u32 compare_size = std::min(size, MaxCompare);
     if (compare_size == 0 || !buffer.IsInBounds(device_addr, compare_size)) {
         return;
@@ -1514,11 +1523,29 @@ void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, 
     if (memory_tracker->IsRegionGpuModified(device_addr, compare_size)) {
         return; // device copy is legitimately ahead of guest memory
     }
+    // Guest ranges with no physical backing read as zeros through CopySparseMemory, so a device
+    // copy holding anything at all would "diverge". 107 of run 77's 120 raw hits were three
+    // recurring buffer-front addresses with an all-zero guest side - unbacked reserve pages, not
+    // corruption. Filtered before any GPU work is issued.
+    const bool guest_backed = memory->ForEachBackingChunk(std::bit_cast<const void*>(device_addr),
+                                                          compare_size, [](const u8*, u64) {});
+    if (!guest_backed) {
+        ++stats.content_unbacked;
+        return;
+    }
+    if (pending_content_checks.size() >= MaxPending) {
+        ++stats.content_dropped; // bounded queue: skip the sample rather than wait
+        return;
+    }
+
+    std::vector<u8> guest_bytes(compare_size);
+    memory->CopySparseMemory(device_addr, guest_bytes.data(), compare_size);
 
     const auto [mapped, download_offset] = download_buffer.Map(compare_size);
     if (!mapped) {
         return;
     }
+    const u64 ring_virtual = download_buffer.MappingVirtualBegin();
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1540,64 +1567,81 @@ void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, 
                       vk::BufferCopy{.srcOffset = buffer_offset,
                                      .dstOffset = download_offset,
                                      .size = compare_size});
-    scheduler.Finish();
+    pending_content_checks.push_back(PendingContentCheck{
+        .device_addr = device_addr,
+        .size = compare_size,
+        .buffer_cpu_addr = buffer.CpuAddr(),
+        .buffer_size = buffer.SizeBytes(),
+        .buffer_generation = buffer.address_generation,
+        .staging = mapped,
+        .ring_virtual = ring_virtual,
+        .tick = scheduler.CurrentTick(),
+        .guest_bytes = std::move(guest_bytes),
+    });
+}
 
-    std::vector<u8> guest_bytes(compare_size);
-    memory->CopySparseMemory(device_addr, guest_bytes.data(), compare_size);
-    ++stats.content_checks;
-    if (std::memcmp(guest_bytes.data(), mapped, compare_size) == 0) {
-        return;
-    }
+void BufferCache::ResolveContentChecks() {
+    while (!pending_content_checks.empty()) {
+        const auto& check = pending_content_checks.front();
+        if (!scheduler.IsFree(check.tick)) {
+            return; // queued in tick order; nothing behind this one has retired either
+        }
+        if (download_buffer.IsRegionStale(check.ring_virtual)) {
+            // The staging ring lapped before we looked: the bytes are no longer ours to read.
+            ++stats.content_dropped;
+            pending_content_checks.pop_front();
+            continue;
+        }
+        ++stats.content_checks;
+        const u8* device_bytes = check.staging;
+        if (std::memcmp(check.guest_bytes.data(), device_bytes, check.size) == 0) {
+            pending_content_checks.pop_front();
+            continue;
+        }
+        // Race filter. The snapshot was taken when the tracker called the range clean; the
+        // device copy executed some time later. A guest write landing anywhere in that window
+        // shows up as either a changed guest side (snapshot != guest now) or a dirty bit. Either
+        // way the game raced the sample - run 77's family 2 - and the normal machinery will
+        // reconcile it. Only a guest side that held still while differing from the device is
+        // a divergence nothing will ever repair.
+        std::vector<u8> guest_now(check.size);
+        memory->CopySparseMemory(check.device_addr, guest_now.data(), check.size);
+        if (std::memcmp(guest_now.data(), check.guest_bytes.data(), check.size) != 0 ||
+            memory_tracker->IsRegionCpuModified(check.device_addr, check.size) ||
+            memory_tracker->IsRegionGpuModified(check.device_addr, check.size)) {
+            ++stats.content_races;
+            pending_content_checks.pop_front();
+            continue;
+        }
 
-    // Run 77 showed the raw mismatch stream is three populations, only one of which is the
-    // invariant violation this exists to find. Filter the other two before reporting:
-    //
-    // 1. Guest ranges with no physical backing read as zeros through CopySparseMemory, so a
-    //    device copy holding anything at all "diverges". 107 of run 77's 120 hits were three
-    //    recurring buffer-front addresses with an all-zero guest side - unbacked reserve pages,
-    //    not corruption. (The tester called this family and asked for exactly this check.)
-    const bool guest_backed = memory->ForEachBackingChunk(std::bit_cast<const void*>(device_addr),
-                                                          compare_size, [](const u8*, u64) {});
-    if (!guest_backed) {
-        ++stats.content_unbacked;
-        return;
+        u32 first = 0;
+        while (first < check.size && check.guest_bytes[first] == device_bytes[first]) {
+            ++first;
+        }
+        u32 differing = 0;
+        for (u32 i = first; i < check.size; ++i) {
+            differing += check.guest_bytes[i] != device_bytes[i] ? 1 : 0;
+        }
+        const u32 dump_at = first & ~15u;
+        const u32 dump_len = std::min<u32>(32, check.size - dump_at);
+        std::string guest_hex, device_hex;
+        for (u32 i = 0; i < dump_len; ++i) {
+            guest_hex += fmt::format("{:02x} ", check.guest_bytes[dump_at + i]);
+            device_hex += fmt::format("{:02x} ", device_bytes[dump_at + i]);
+        }
+        const bool guest_zero = std::all_of(check.guest_bytes.begin(), check.guest_bytes.end(),
+                                            [](u8 b) { return b == 0; });
+        ++stats.content_mismatches;
+        LOG_ERROR(Render_Vulkan,
+                  "Silent cache divergence: addr={:#x}, compared={} bytes, first_diff=+{:#x}, "
+                  "differing={} bytes, guest_zero={}, buffer=[{:#x},{:#x}) generation={}; "
+                  "guest[{:#x}]: {}; device[{:#x}]: {}",
+                  check.device_addr, check.size, first, differing, guest_zero,
+                  check.buffer_cpu_addr, check.buffer_cpu_addr + check.buffer_size,
+                  check.buffer_generation, check.device_addr + dump_at, guest_hex,
+                  check.device_addr + dump_at, device_hex);
+        pending_content_checks.pop_front();
     }
-    // 2. The compare window contains a full GPU drain, during which the guest writes freely. A
-    //    write landing after the clean-range check but before the memcmp produces a mismatch
-    //    with inconsistent direction - run 77's family 2 signature. The tracker has recorded
-    //    such a write by now, so recheck: if the range is no longer clean on either side, this
-    //    was a race with the game, not a divergence, and the normal machinery will reconcile it.
-    if (memory_tracker->IsRegionCpuModified(device_addr, compare_size) ||
-        memory_tracker->IsRegionGpuModified(device_addr, compare_size)) {
-        ++stats.content_races;
-        return;
-    }
-
-    u32 first = 0;
-    while (first < compare_size && guest_bytes[first] == mapped[first]) {
-        ++first;
-    }
-    u32 differing = 0;
-    for (u32 i = first; i < compare_size; ++i) {
-        differing += guest_bytes[i] != mapped[i] ? 1 : 0;
-    }
-    const u32 dump_at = first & ~15u;
-    const u32 dump_len = std::min<u32>(32, compare_size - dump_at);
-    std::string guest_hex, device_hex;
-    for (u32 i = 0; i < dump_len; ++i) {
-        guest_hex += fmt::format("{:02x} ", guest_bytes[dump_at + i]);
-        device_hex += fmt::format("{:02x} ", mapped[dump_at + i]);
-    }
-    const bool guest_zero =
-        std::all_of(guest_bytes.begin(), guest_bytes.end(), [](u8 b) { return b == 0; });
-    ++stats.content_mismatches;
-    LOG_ERROR(Render_Vulkan,
-              "Silent cache divergence: addr={:#x}, compared={} bytes, first_diff=+{:#x}, "
-              "differing={} bytes, guest_zero={}, buffer=[{:#x},{:#x}) generation={}; "
-              "guest[{:#x}]: {}; device[{:#x}]: {}",
-              device_addr, compare_size, first, differing, guest_zero, buffer.CpuAddr(),
-              buffer.CpuAddr() + buffer.SizeBytes(), buffer.address_generation,
-              device_addr + dump_at, guest_hex, device_addr + dump_at, device_hex);
 }
 
 vk::Buffer BufferCache::UploadCopies(const Buffer& buffer, std::span<vk::BufferCopy> copies,

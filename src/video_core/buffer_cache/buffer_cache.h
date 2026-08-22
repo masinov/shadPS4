@@ -6,7 +6,9 @@
 #include <functional>
 
 #include <array>
+#include <deque>
 #include <span>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
 
@@ -272,7 +274,9 @@ public:
         u64 content_mismatches{}; ///< confirmed divergences (backed, and still clean on recheck)
         u64 content_races{};      ///< mismatches explained by a write landing during the compare
         u64 content_unbacked{};   ///< mismatches on guest ranges with no physical backing
-        u64 overlap_uploads{};    ///< uploads that carried a CPU-dirty AND GPU-modified page
+        u64 content_dropped{}; ///< checks abandoned (queue full or staging lapped) - never waited
+                               ///< for
+        u64 overlap_uploads{}; ///< uploads that carried a CPU-dirty AND GPU-modified page
         u64 overlap_upload_pages{};
         u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
                                    ///< transition still completed
@@ -333,6 +337,25 @@ private:
     /// device buffer and in guest memory. A divergence here is corruption that nothing will ever
     /// repair, because no dirty bit is set to trigger a re-upload.
     void ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, u32 size);
+
+    /// Compares every queued content check whose device copy has retired. Never waits on the
+    /// GPU: checks whose tick is still in flight stay queued.
+    void ResolveContentChecks();
+
+    /// One sampled device-vs-guest comparison in flight. The guest side is snapshotted when
+    /// the check is issued; the device side lands in `staging` once `tick` retires.
+    struct PendingContentCheck {
+        VAddr device_addr;
+        u32 size;
+        VAddr buffer_cpu_addr;
+        u64 buffer_size;
+        u64 buffer_generation;
+        const u8* staging;
+        u64 ring_virtual;
+        u64 tick;
+        std::vector<u8> guest_bytes;
+    };
+    std::deque<PendingContentCheck> pending_content_checks;
 
     /// Freshly downloads [device_addr, device_addr+size) from its cache buffer and writes it to
     /// guest memory. Used when a parked preemptive staging pointer has gone stale.
