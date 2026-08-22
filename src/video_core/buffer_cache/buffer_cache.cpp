@@ -1549,6 +1549,30 @@ void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, 
         return;
     }
 
+    // Run 77 showed the raw mismatch stream is three populations, only one of which is the
+    // invariant violation this exists to find. Filter the other two before reporting:
+    //
+    // 1. Guest ranges with no physical backing read as zeros through CopySparseMemory, so a
+    //    device copy holding anything at all "diverges". 107 of run 77's 120 hits were three
+    //    recurring buffer-front addresses with an all-zero guest side - unbacked reserve pages,
+    //    not corruption. (The tester called this family and asked for exactly this check.)
+    const bool guest_backed = memory->ForEachBackingChunk(std::bit_cast<const void*>(device_addr),
+                                                          compare_size, [](const u8*, u64) {});
+    if (!guest_backed) {
+        ++stats.content_unbacked;
+        return;
+    }
+    // 2. The compare window contains a full GPU drain, during which the guest writes freely. A
+    //    write landing after the clean-range check but before the memcmp produces a mismatch
+    //    with inconsistent direction - run 77's family 2 signature. The tracker has recorded
+    //    such a write by now, so recheck: if the range is no longer clean on either side, this
+    //    was a race with the game, not a divergence, and the normal machinery will reconcile it.
+    if (memory_tracker->IsRegionCpuModified(device_addr, compare_size) ||
+        memory_tracker->IsRegionGpuModified(device_addr, compare_size)) {
+        ++stats.content_races;
+        return;
+    }
+
     u32 first = 0;
     while (first < compare_size && guest_bytes[first] == mapped[first]) {
         ++first;
@@ -1564,12 +1588,14 @@ void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, 
         guest_hex += fmt::format("{:02x} ", guest_bytes[dump_at + i]);
         device_hex += fmt::format("{:02x} ", mapped[dump_at + i]);
     }
+    const bool guest_zero =
+        std::all_of(guest_bytes.begin(), guest_bytes.end(), [](u8 b) { return b == 0; });
     ++stats.content_mismatches;
     LOG_ERROR(Render_Vulkan,
               "Silent cache divergence: addr={:#x}, compared={} bytes, first_diff=+{:#x}, "
-              "differing={} bytes, buffer=[{:#x},{:#x}) generation={}; guest[{:#x}]: {}; "
-              "device[{:#x}]: {}",
-              device_addr, compare_size, first, differing, buffer.CpuAddr(),
+              "differing={} bytes, guest_zero={}, buffer=[{:#x},{:#x}) generation={}; "
+              "guest[{:#x}]: {}; device[{:#x}]: {}",
+              device_addr, compare_size, first, differing, guest_zero, buffer.CpuAddr(),
               buffer.CpuAddr() + buffer.SizeBytes(), buffer.address_generation,
               device_addr + dump_at, guest_hex, device_addr + dump_at, device_hex);
 }

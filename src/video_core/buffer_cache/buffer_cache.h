@@ -269,8 +269,10 @@ public:
         u64 uploads{}; ///< guest->device synchronization copies (the true load-pressure gauge)
         u64 preemptive_stale_rescues{}; ///< parked staging pointers invalidated by ring reuse
         u64 content_checks{};           ///< device-vs-guest comparisons performed
-        u64 content_mismatches{};       ///< ranges the tracker called clean that had diverged
-        u64 overlap_uploads{};          ///< uploads that carried a CPU-dirty AND GPU-modified page
+        u64 content_mismatches{}; ///< confirmed divergences (backed, and still clean on recheck)
+        u64 content_races{};      ///< mismatches explained by a write landing during the compare
+        u64 content_unbacked{};   ///< mismatches on guest ranges with no physical backing
+        u64 overlap_uploads{};    ///< uploads that carried a CPU-dirty AND GPU-modified page
         u64 overlap_upload_pages{};
         u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
                                    ///< transition still completed
