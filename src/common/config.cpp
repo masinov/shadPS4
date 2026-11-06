@@ -253,8 +253,15 @@ static ConfigEntry<bool> useSparseCacheBuffers(false);
 static ConfigEntry<bool> useEvictionReadback(true);
 static ConfigEntry<bool> useSparseBlockReclaim(false);
 static ConfigEntry<bool> useIndirectDispatchClamp(true);
+// Zeroes non-indexed indirect draws whose vertex or instance count is out of range.
+static ConfigEntry<bool> useIndirectDrawClamp(true);
+// Upper bound on the iterations of any one loop in a compute shader, per entry into the loop.
+// Guest shaders that spin waiting for another queue never see that queue advance here, because
+// every guest queue is serialized onto one host queue; unbounded, such a loop hangs the device.
+// 0 disables the bound. Changing the value invalidates the on-disk shader cache.
+static ConfigEntry<int> computeLoopIterationLimit(65536);
 // Samples the device-copy-equals-guest-memory invariant on ranges both caches call clean. One
-// comparison per 4096 synchronizations - a small download and drain every few seconds.
+// queued 4 KiB comparison per 4096 synchronizations; it never waits on the GPU.
 static ConfigEntry<bool> useContentValidator(true);
 // Image-side fault service. Defaulted off for one build on a misattributed regression: the
 // half-framerate session that prompted it was the accuracy experiment (233 read faults per
@@ -642,6 +649,14 @@ bool getUseSparseBlockReclaim() {
 
 bool getUseIndirectDispatchClamp() {
     return useIndirectDispatchClamp.get();
+}
+
+bool getUseIndirectDrawClamp() {
+    return useIndirectDrawClamp.get();
+}
+
+u32 getComputeLoopIterationLimit() {
+    return static_cast<u32>(std::max(computeLoopIterationLimit.get(), 0));
 }
 
 bool getUseContentValidator() {
@@ -1962,6 +1977,9 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useEvictionReadback.setFromToml(general, "useEvictionReadback", is_game_specific);
         useSparseBlockReclaim.setFromToml(general, "useSparseBlockReclaim", is_game_specific);
         useIndirectDispatchClamp.setFromToml(general, "useIndirectDispatchClamp", is_game_specific);
+        useIndirectDrawClamp.setFromToml(general, "useIndirectDrawClamp", is_game_specific);
+        computeLoopIterationLimit.setFromToml(general, "computeLoopIterationLimit",
+                                              is_game_specific);
         useContentValidator.setFromToml(general, "useContentValidator", is_game_specific);
         useImageFaultService.setFromToml(general, "useImageFaultService", is_game_specific);
         forceAccuratePageWatchers.setFromToml(general, "forceAccuratePageWatchers",
@@ -2456,6 +2474,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["General"]["useEvictionReadback"] = useEvictionReadback.base_value;
         data["General"]["useSparseBlockReclaim"] = useSparseBlockReclaim.base_value;
         data["General"]["useIndirectDispatchClamp"] = useIndirectDispatchClamp.base_value;
+        data["General"]["useIndirectDrawClamp"] = useIndirectDrawClamp.base_value;
+        data["General"]["computeLoopIterationLimit"] = computeLoopIterationLimit.base_value;
         data["General"]["useContentValidator"] = useContentValidator.base_value;
         data["General"]["useImageFaultService"] = useImageFaultService.base_value;
         data["General"]["forceAccuratePageWatchers"] = forceAccuratePageWatchers.base_value;
@@ -2854,6 +2874,8 @@ void setDefaultValues() {
     useEvictionReadback = true;
     useSparseBlockReclaim = false;
     useIndirectDispatchClamp = true;
+    useIndirectDrawClamp = true;
+    computeLoopIterationLimit = 65536;
     useContentValidator = true;
     useImageFaultService = true;
     forceAccuratePageWatchers = false;

@@ -216,6 +216,12 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Byte-granular: true when a buffer-side GPU write was recorded inside [addr, addr+size)
+    /// and has not been downloaded or flushed since.
+    [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
+
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
@@ -276,8 +282,6 @@ public:
         u64 content_unbacked{};   ///< mismatches on guest ranges with no physical backing
         u64 content_dropped{}; ///< checks abandoned (queue full or staging lapped) - never waited
                                ///< for
-        u64 overlap_uploads{}; ///< uploads that carried a CPU-dirty AND GPU-modified page
-        u64 overlap_upload_pages{};
         u64 upload_bytes{};        ///< services that found no tracker data (raced) - state
                                    ///< transition still completed
         u64 takeover_mismatches{}; ///< sparse merges where taken bytes != absorbed bytes

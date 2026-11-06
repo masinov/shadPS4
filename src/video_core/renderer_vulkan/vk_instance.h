@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -56,6 +57,11 @@ public:
 
     /// Logs the first available VK_EXT_device_fault report after a device-lost result.
     void ReportDeviceLoss(std::string_view operation) const;
+
+    /// Registers extra reporting to run once when the device is lost.
+    void SetDeviceLossCallback(std::function<void()> callback) const {
+        device_loss_callback = std::move(callback);
+    }
 
     [[nodiscard]] bool HasDeviceLoss() const {
         return device_fault_reported.test(std::memory_order_relaxed);
@@ -602,6 +608,7 @@ private:
     mutable GpuCheckpointTracker checkpoint_tracker;
     mutable BufferAddressTracker buffer_address_tracker;
     mutable std::atomic_flag device_fault_reported = ATOMIC_FLAG_INIT;
+    mutable std::function<void()> device_loss_callback;
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

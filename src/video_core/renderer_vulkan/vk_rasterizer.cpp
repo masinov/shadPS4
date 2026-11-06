@@ -54,6 +54,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       rt_sync_{instance, scheduler, texture_cache}, liverpool{liverpool_},
       predication{instance, scheduler, buffer_cache}, dispatch_guard{instance, scheduler},
       memory{Core::Memory::Instance()}, pipeline_cache{instance, scheduler, liverpool} {
+    instance.SetDeviceLossCallback([this] {
+        dispatch_guard.LogRecent();
+        // The process is about to abort; an archive that is not finalized cannot be opened again.
+        pipeline_cache.Sync();
+    });
     buffer_cache.SetAllocationReclaimCallback(
         [this](u64 reclaim_target, u64 allocation_size, bool forced, bool allow_texture_gc) {
             ReclaimForAllocation(reclaim_target, allocation_size, forced, allow_texture_gc);
@@ -290,6 +295,23 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
+    // Out-of-range draw arguments hang the device like out-of-range dispatch arguments do. The
+    // single non-indexed draw is the form every recorded indirect-draw device loss had. The
+    // arguments are validated by a pre-pass when the draw executes, whatever the page tracker
+    // says about who wrote them: run 83 lost the device on a draw whose arguments the tracker
+    // called CPU-authored and whose guest-memory vertex count was zero, so the device copy the
+    // GPU reads is not what guest memory shows.
+    const VAddr args_address = arg_address + offset;
+    const bool clamp_on_gpu = !is_indexed && max_count == 1 && count_address == 0 &&
+                              stride == sizeof(VkDrawIndirectCommand) &&
+                              Config::getUseIndirectDrawClamp();
+    std::array<u32, 2> record_counts{};
+    if (clamp_on_gpu) {
+        std::memcpy(record_counts.data(), reinterpret_cast<const void*>(args_address),
+                    sizeof(record_counts));
+    }
+    const bool args_gpu_modified = buffer_cache.IsRegionGpuModified(args_address, stride);
+
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
@@ -318,9 +340,22 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4);
     }
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
+    // A clamped draw reads its arguments in the clamp's compute pre-pass, not in the indirect
+    // stage; see DispatchIndirect.
+    if (auto barrier =
+            buffer->GetBarrier(clamp_on_gpu ? vk::AccessFlagBits2::eShaderStorageRead
+                                            : vk::AccessFlagBits2::eIndirectCommandRead,
+                               clamp_on_gpu ? vk::PipelineStageFlagBits2::eComputeShader
+                                            : vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
+    }
+    // The pre-pass is a compute dispatch: it cannot run inside the render pass, and it has to be
+    // recorded before the guest pipeline's descriptors and push constants.
+    DispatchGuard::ClampedArgs draw_args{buffer->Handle(), base};
+    if (clamp_on_gpu) {
+        scheduler.EndRendering();
+        draw_args = dispatch_guard.ClampDraw(scheduler.CommandBuffer(), buffer->Handle(), base,
+                                             args_address);
     }
     if (count_buffer) {
         if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
@@ -359,6 +394,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         checkpoint.source_offset = base;
         checkpoint.destination_guest_address = count_address;
         checkpoint.destination_generation = count_buffer ? count_buffer->address_generation : 0;
+        // Vertex and instance count as guest memory held them at record time (x and y). z has
+        // bit 0 set when the execution-time pre-pass guards this draw and bit 1 set when the
+        // page tracker held the arguments to be GPU-written.
+        checkpoint.group_x = record_counts[0];
+        checkpoint.group_y = record_counts[1];
+        checkpoint.group_z = (clamp_on_gpu ? 1 : 0) | (args_gpu_modified ? 2 : 0);
+        checkpoint.record_time_groups = true;
         instance.InsertCheckpoint(cmdbuf, GpuCheckpoint::IndirectDraw, checkpoint);
     }
 
@@ -379,7 +421,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_base,
                                      max_count, stride);
         } else {
-            cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
+            cmdbuf.drawIndirect(draw_args.buffer, draw_args.offset, max_count, stride);
         }
         DebugState.IncDrawCall();
     }
@@ -480,7 +522,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
     // guest dispatch's set 0 - the shader executed against the clamp's buffers, corrupting
     // arbitrary memory. Order here is clamp first, guest descriptors second.
     const auto cmdbuf = scheduler.CommandBuffer();
-    const auto clamped_args = clamp_enabled ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base)
+    const auto clamped_args = clamp_enabled ? dispatch_guard.Clamp(cmdbuf, buffer->Handle(), base,
+                                                                   address + offset)
                                             : DispatchGuard::ClampedArgs{buffer->Handle(), base};
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
@@ -732,6 +775,14 @@ void Rasterizer::OnSubmit() {
                   guard_skips - last_guard_skips, guard_skips);
         last_guard_skips = guard_skips;
     }
+    if (const u32 draw_skips = dispatch_guard.DrawClampCount();
+        draw_skips != last_draw_guard_skips) {
+        LOG_ERROR(Render_Vulkan,
+                  "Indirect draw guard: zeroed {} draw(s) this interval, {} total - the "
+                  "arguments the GPU read were out of range",
+                  draw_skips - last_draw_guard_skips, draw_skips);
+        last_draw_guard_skips = draw_skips;
+    }
     instance.SetMemoryAllocatorFrameIndex(++memory_allocator_frame_index);
     // Eviction age is counted in guest submissions, independently of how many collector passes
     // allocation preflight ran in between.
@@ -863,7 +914,7 @@ void Rasterizer::OnSubmit() {
                 "sparse_binds={} ({} ms total, max {} ms), block_reclaims={} ({} MiB, age={}), "
                 "stale_hints={}, vertex_misses={}, takeover_mismatches={}, "
                 "fault_readbacks={}r/{}w ({} MiB, empty={}), uploads={} ({} MiB), "
-                "overlap={}x ({} pages), content={}chk/{}bad/{}race/{}unbacked/{}dropped, "
+                "content={}chk/{}bad/{}race/{}unbacked/{}dropped, "
                 "stale_rescues={}, usage={} MiB",
                 cache_stats.live_buffers, cache_stats.bound_bytes / 1_MB, cache_stats.replacements,
                 cache_stats.replacements_new, cache_stats.replacements_grow,
@@ -876,13 +927,15 @@ void Rasterizer::OnSubmit() {
                 cache_stats.takeover_mismatches, cache_stats.fault_readbacks_read,
                 cache_stats.fault_readbacks_write, cache_stats.fault_readback_bytes / 1_MB,
                 cache_stats.fault_serviced_empty, cache_stats.uploads,
-                cache_stats.upload_bytes / 1_MB, cache_stats.overlap_uploads,
-                cache_stats.overlap_upload_pages, cache_stats.content_checks,
+                cache_stats.upload_bytes / 1_MB, cache_stats.content_checks,
                 cache_stats.content_mismatches, cache_stats.content_races,
                 cache_stats.content_unbacked, cache_stats.content_dropped,
                 cache_stats.preemptive_stale_rescues, used_memory / 1_MB);
-            LOG_INFO(Render_Vulkan, "Indirect dispatch guard: insane_skipped={}",
-                     dispatch_guard.ClampCount());
+            LOG_INFO(Render_Vulkan,
+                     "Indirect dispatch guard: insane_skipped={}, draws_guarded={}, "
+                     "draws_zeroed={}",
+                     dispatch_guard.ClampCount(), dispatch_guard.GuardedDraws(),
+                     dispatch_guard.DrawClampCount());
             LOG_INFO(Render_Vulkan,
                      "Sparse reclaim ghosts: hits={} ({} MiB), live={}, limbo={} MiB, "
                      "reinstated={} ({} MiB), rescued={} ({} MiB), distance histogram "

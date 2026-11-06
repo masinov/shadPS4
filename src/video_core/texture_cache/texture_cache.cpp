@@ -336,7 +336,8 @@ void TextureCache::ApplyReadyReadbacks() {
     }
 }
 
-u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
+u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size,
+                                    std::span<const std::pair<VAddr, VAddr>> buffer_written) {
     // The CPU faulted on [addr, addr+size) and the buffer cache has already written its bytes
     // back to guest memory. Render-target and storage-image writes never reach the cached
     // buffer, so for image-authored ranges those bytes are stale; download the image's texels
@@ -371,7 +372,28 @@ u32 TextureCache::ServiceFaultRange(VAddr addr, u64 size) {
             ++readback_stats.fault_aborted_dirty;
             continue;
         }
-        if (!IsReadbackViable(image_id, image)) {
+        const VAddr image_begin = image.info.guest_address;
+        const VAddr image_end = image_begin + image.info.guest_size;
+        // A head or tail page can be untracked without the image being marked dirty; guest
+        // writes to the image's bytes on that page are then unseen. (A MaybeCpuDirty image is
+        // wholly untracked and is resolved by content hash below instead.)
+        if (False(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+            (image.track_addr != image_begin || image.track_addr_end != image_end)) {
+            ++readback_stats.fault_aborted_dirty;
+            continue;
+        }
+        // Same restrictions as the eviction readback: color only (the stencil plane would be
+        // written back as scratch fill), and never over bytes the buffer side GPU-wrote - an
+        // image there is stale, its memory reused for buffer data no CPU write ever announced,
+        // and its texels would replace that data in guest memory and on the next upload.
+        const bool buffer_authored =
+            std::ranges::any_of(buffer_written,
+                                [&](const auto& range) {
+                                    return range.first < image_end && image_begin < range.second;
+                                }) ||
+            buffer_cache.IsRangeGpuWritten(image_begin, image.info.guest_size);
+        if (image.aspect_mask != vk::ImageAspectFlagBits::eColor || buffer_authored ||
+            !IsReadbackViable(image_id, image)) {
             ++readback_stats.fault_aborted_viability;
             continue;
         }
@@ -1365,12 +1387,10 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
             // GPU-authored contents cannot be discarded, but they can be written back to guest
             // memory asynchronously; once that completes the image is CPU-authoritative and a
             // later pass can evict it. Nominate a bounded number of large candidates per pass.
-            // The eviction readback was designed for readbackSpeed=Disable, where nothing else
-            // writes GPU snapshots into guest memory. Under armed modes the tracker-driven
-            // service owns that job; two overlapping writers with live protection is untested
-            // interplay with no upside.
+            // Runs in every readback mode: the fault service only writes back what the guest
+            // happens to touch, so without this, retired render targets are never evictable
+            // and usage climbs past the budget for the whole session.
             if (Config::getUseEvictionReadback() &&
-                Config::readbackSpeed() == Config::ReadbackSpeed::Disable &&
                 False(image.flags & ImageFlagBits::EvictionReadback) &&
                 False(image.flags & ImageFlagBits::Dirty) &&
                 image.info.pixel_format != vk::Format::eUndefined &&
@@ -1408,10 +1428,10 @@ GcResult TextureCache::RunGarbageCollector(GcBudget& budget) {
     lru_cache.ForEachItemBelow(cutoff, collect);
     result.skipped_gpu_modified_unique = static_cast<u32>(skipped_unique.size());
     if (result.skipped_gpu_modified > 0) {
-        // Identity samples settle whether the persistently skipped GPU-modified population is the
-        // same stuck set every pass or a rotating fresh one (Run 39 open question). Three per
-        // pass at GC-pass frequency is a negligible log cost.
-        for (u32 i = 0; i < 3 && i < result.skipped_gpu_modified; ++i) {
+        // Identity samples of the skipped GPU-modified population. Under sustained pressure the
+        // collector runs about twice a second, so the passes themselves are sampled.
+        const bool log_samples = ShouldLogDiagnosticSample(++gc_skip_sample_log_count);
+        for (u32 i = 0; log_samples && i < 3 && i < result.skipped_gpu_modified; ++i) {
             const ImageId sample_id = skipped_gpu_modified_samples[i];
             if (!sample_id) {
                 continue;

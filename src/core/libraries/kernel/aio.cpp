@@ -262,8 +262,19 @@ s64 ReadNative(const std::shared_ptr<Core::FileSys::File>& file, void* buffer, u
     const u64 file_size = file->GetSize();
     const u64 readable = offset < file_size ? std::min(size, file_size - offset) : 0;
     Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(buffer), readable);
-    const s64 result = file->PRead(buffer, readable, offset);
-    return result < 0 ? ORBIS_KERNEL_ERROR_EIO : result;
+    // Read into host memory and copy: the GPU thread can write-protect a destination page
+    // again before the read lands, and a host read straight into a protected guest page fails
+    // inside the kernel where the page-fault handler never sees it. The copy faults normally.
+    thread_local std::vector<u8> staging;
+    if (staging.size() < readable) {
+        staging.resize(readable);
+    }
+    const s64 result = file->PRead(staging.data(), readable, offset);
+    if (result < 0) {
+        return ORBIS_KERNEL_ERROR_EIO;
+    }
+    std::memcpy(buffer, staging.data(), static_cast<size_t>(result));
+    return result;
 }
 
 s64 WriteNative(const std::shared_ptr<Core::FileSys::File>& file, const void* buffer, u64 size,

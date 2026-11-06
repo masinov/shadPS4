@@ -143,6 +143,14 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 }
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
+    // Compute loops get an iteration counter that ends the loop at the profile's limit. A guest
+    // shader may spin until another queue publishes work; with every guest queue serialized onto
+    // one host queue that never happens while the shader runs, and the spin hangs the device.
+    const u32 loop_limit =
+        ctx.stage == Stage::Compute ? ctx.profile.compute_loop_iteration_limit : 0;
+    // Counter of the loop whose merge block is emitted next; it is zeroed there so that the
+    // limit applies to each entry into the loop, not to the invocation.
+    Id finished_loop_counter{};
     IR::Block* current_block{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
@@ -155,6 +163,10 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             ctx.AddLabel(label);
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
+            }
+            if (Sirit::ValidId(finished_loop_counter)) {
+                ctx.OpStore(finished_loop_counter, ctx.u32_zero_value);
+                finished_loop_counter = Id{};
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -188,6 +200,17 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (loop_limit != 0) {
+                const Id counter{ctx.DefineVariable(ctx.U32[1], std::nullopt,
+                                                    spv::StorageClass::Private,
+                                                    ctx.u32_zero_value)};
+                const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], counter),
+                                          ctx.u32_one_value)};
+                ctx.OpStore(counter, count);
+                cond = ctx.OpLogicalAnd(
+                    ctx.U1[1], cond, ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(loop_limit)));
+                finished_loop_counter = counter;
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);

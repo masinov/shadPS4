@@ -234,6 +234,9 @@ void Instance::ReportDeviceLoss(std::string_view operation) const {
     }
 
     LOG_CRITICAL(Render_Vulkan, "Vulkan device lost during {}.", operation);
+    if (device_loss_callback) {
+        device_loss_callback();
+    }
     if (diagnostic_checkpoints) {
         const auto checkpoints = graphics_queue.getCheckpointDataNV();
         if (checkpoints.empty()) {

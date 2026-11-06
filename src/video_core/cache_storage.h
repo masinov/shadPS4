@@ -33,6 +33,8 @@ public:
     }
     void FinishPreload();
     void ResetShaderCacheState();
+    /// Drops every stored blob and leaves the opened cache empty and writable.
+    void Discard();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

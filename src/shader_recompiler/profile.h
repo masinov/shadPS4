@@ -14,6 +14,8 @@ struct Profile {
     u32 max_shared_memory_size{};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
+    // Iteration bound applied to every loop of a compute shader; 0 leaves loops unbounded.
+    u32 compute_loop_iteration_limit{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
@@ -58,6 +60,7 @@ struct Profile {
                max_viewport_height != other.max_viewport_height ||
                max_shared_memory_size != other.max_shared_memory_size ||
                supported_spirv != other.supported_spirv || subgroup_size != other.subgroup_size ||
+               compute_loop_iteration_limit != other.compute_loop_iteration_limit ||
                support_int8 != other.support_int8 || support_int16 != other.support_int16 ||
                support_int64 != other.support_int64 || support_float16 != other.support_float16 ||
                support_float64 != other.support_float64 ||

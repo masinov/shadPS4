@@ -189,6 +189,7 @@ private:
     u32 gc_log_count{};
     u32 cache_stats_log_count{};
     u32 last_guard_skips{};
+    u32 last_draw_guard_skips{};
     u64 indirect_dispatch_log_count{};
     u32 memory_allocator_frame_index{};
     u64 allocation_gc_pass_count{};

@@ -5,7 +5,9 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <thread>
+#include <utility>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
@@ -135,8 +137,11 @@ private:
 public:
     /// Fault-service twin of the eviction readback: writes the texels of GPU-modified images
     /// overlapping [addr, addr+size) into guest memory. Called by the buffer cache after its own
-    /// download so image bytes win wherever both claim a page. Returns images serviced.
-    u32 ServiceFaultRange(VAddr addr, u64 size);
+    /// download so image bytes win wherever both claim a page. `buffer_written` lists the byte
+    /// ranges of the faulted pages that the buffer side had GPU-written before that download.
+    /// Returns images serviced.
+    u32 ServiceFaultRange(VAddr addr, u64 size,
+                          std::span<const std::pair<VAddr, VAddr>> buffer_written);
 
     /// Add an image to the download queue for guest memory writeback on next submit.
     void AddDownload(ImageId image_id) {
@@ -373,6 +378,7 @@ private:
     u64 gc_tick = 0;
     std::vector<ImageId> eviction_readbacks;
     std::array<ImageId, 3> skipped_gpu_modified_samples{};
+    u64 gc_skip_sample_log_count{};
 
 public:
     struct ReadbackStats {

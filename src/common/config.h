@@ -247,6 +247,8 @@ bool getUseSparseCacheBuffers();
 bool getUseEvictionReadback();
 bool getUseSparseBlockReclaim();
 bool getUseIndirectDispatchClamp();
+bool getUseIndirectDrawClamp();
+u32 getComputeLoopIterationLimit();
 bool getUseContentValidator();
 bool getUseImageFaultService();
 bool getForceAccuratePageWatchers();

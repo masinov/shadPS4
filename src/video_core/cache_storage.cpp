@@ -212,6 +212,23 @@ void DataBase::ResetShaderCacheState() {
     ar_is_read_only = false;
 }
 
+void DataBase::Discard() {
+    if (!opened) {
+        return;
+    }
+    if (Config::isPipelineCacheArchived()) {
+        mz_zip_reader_end(&zip_ar);
+        mz_zip_zero_struct(&zip_ar);
+        mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
+        ar_is_read_only = false;
+    } else {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
+}
+
 template <typename T>
 void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
     using namespace Common::FS;

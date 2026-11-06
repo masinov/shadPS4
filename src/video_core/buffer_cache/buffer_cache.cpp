@@ -132,14 +132,21 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         }
     }
     if (preemptive_usable) {
+        // Each entry is written back whole, so it must also be retired whole: a remnant left in
+        // the map keeps the original address and size, and consuming it later would write the
+        // entire entry again over pages the guest has modified since.
+        boost::container::small_vector<std::pair<VAddr, u64>, 4> consumed;
         preemptive_downloads.ForEachInRange(
             page_addr, PageManager::PAGE_SIZE,
             [&](VAddr begin, VAddr end, const PreemptiveDownload& download) {
                 scheduler.Wait(download.done_tick);
                 memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
                                         download.size);
+                consumed.emplace_back(download.device_addr, download.size);
             });
-        preemptive_downloads.Subtract(page_addr, PageManager::PAGE_SIZE);
+        for (const auto& [entry_addr, entry_size] : consumed) {
+            preemptive_downloads.Subtract(entry_addr, entry_size);
+        }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     } else {
         MarkBufferUsed(buffer);
@@ -230,22 +237,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     const VAddr aligned_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
     device_addr = aligned_begin;
     size = aligned_end - aligned_begin;
-    // if write tick == current_tick -> send flush request
-
-    const u64 page = device_addr >> CACHING_PAGEBITS;
-    const BufferId buffer_id = page_table[page].buffer_id;
-    const Buffer& buffer = slot_buffers[buffer_id];
-    // ASSERT(buffer.IsInBounds(device_addr, size));
 
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
+        // The download below forgets which bytes of the faulted pages the buffer side wrote;
+        // the image service needs that to tell a live image from a stale one whose memory the
+        // game now uses for GPU-written buffer data.
+        boost::container::small_vector<std::pair<VAddr, VAddr>, 4> buffer_written;
+        const bool service_images = Config::getUseImageFaultService();
+        if (service_images) {
+            gpu_modified_ranges.ForEachInRange(
+                device_addr, size,
+                [&](VAddr begin, VAddr end) { buffer_written.emplace_back(begin, end); });
+        }
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
         // Image-authored content second, so its texels overwrite the buffer's bytes wherever
         // both claim the faulted pages: render-target and storage-image writes never reach the
         // cached buffer, so for those ranges the bytes the buffer download just planted are
-        // stale - the mode-3 flashing-texture mechanism.
-        if (Config::getUseImageFaultService()) {
-            texture_cache.ServiceFaultRange(device_addr, size);
+        // stale.
+        if (service_images) {
+            texture_cache.ServiceFaultRange(device_addr, size, buffer_written);
         }
     });
 }
@@ -1096,19 +1107,19 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool allo
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, sparse_binds);
     }
-    // Every replacement, unsampled: grow rewrites buffer backing under live guest ranges more
-    // often than any other operation (2,779 times in Run 39) and has never been individually
-    // observable. ~4 compact lines per second; the Run 25 flood was an order of magnitude denser.
-    LOG_INFO(Render_Vulkan,
-             "Buffer replace: reason={}, req=[{:#x},{:#x}), old=[{:#x},{:#x}), new=[{:#x},{:#x}), "
-             "overlaps={}, gpu_mod={}, leap={}",
-             overlap.ids.empty()       ? "new"
-             : overlap.ids.size() == 1 ? "grow"
-                                       : "bridge",
-             requested_addr, requested_addr + requested_size, first_overlap_base,
-             first_overlap_base + first_overlap_size, overlap.begin, overlap.end,
-             overlap.ids.size(), gpu_modified_ranges.Intersects(overlap.begin, size),
-             overlap.has_stream_leap);
+    // Sampled like the other allocation diagnostics; the log is synchronous.
+    if (ShouldLogDiagnosticSample(replacement_count)) {
+        LOG_INFO(Render_Vulkan,
+                 "Buffer replace: reason={}, req=[{:#x},{:#x}), old=[{:#x},{:#x}), "
+                 "new=[{:#x},{:#x}), overlaps={}, gpu_mod={}, leap={}",
+                 overlap.ids.empty()       ? "new"
+                 : overlap.ids.size() == 1 ? "grow"
+                                           : "bridge",
+                 requested_addr, requested_addr + requested_size, first_overlap_base,
+                 first_overlap_base + first_overlap_size, overlap.begin, overlap.end,
+                 overlap.ids.size(), gpu_modified_ranges.Intersects(overlap.begin, size),
+                 overlap.has_stream_leap);
+    }
     if (sparse_buffers) {
         // Inherited blocks cover the absorbed buffers; the pages of the request itself may still be
         // unbound (fresh range or the reserve of an absorbed buffer). Reserve pages beyond the
@@ -1413,25 +1424,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // important for direct-memory shaders, which dereference the BDA page table at execution time.
     MarkBufferUsed(buffer);
     EnsureRangeBound(buffer, device_addr, size);
-    // Collision probe: a page that is simultaneously CPU-dirty and GPU-modified is about to be
-    // re-uploaded from guest RAM, and RAM either never received the GPU-authored bytes
-    // (readback disabled) or holds a stale copy (service raced or failed). Neither side can be
-    // reconciled losslessly at page granularity, so this is corruption being fed to the GPU:
-    // the geometry-explosion mechanism. The fault service exists to keep the two states
-    // mutually exclusive - any nonzero count here measures the residual hole, and doubles as
-    // the feasibility gauge for pinning contested pages to host memory.
-    const u64 overlap_pages = memory_tracker->GetCpuGpuOverlapPages(device_addr, size);
-    if (overlap_pages != 0) {
-        ++stats.overlap_uploads;
-        stats.overlap_upload_pages += overlap_pages;
-        if (stats.overlap_uploads <= 16 ||
-            (stats.overlap_uploads & (stats.overlap_uploads - 1)) == 0) {
-            LOG_WARNING(Render_Vulkan,
-                        "CPU/GPU collision at upload: addr={:#x}, size={:#x}, pages={}, "
-                        "written={} (event #{})",
-                        device_addr, size, overlap_pages, is_written, stats.overlap_uploads);
-        }
-    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -1512,6 +1504,14 @@ void BufferCache::ValidateBufferAgainstGuest(Buffer& buffer, VAddr device_addr, 
     static constexpr size_t MaxPending = 32;
     ResolveContentChecks();
 
+    // Rotate through the range instead of always sampling its first bytes, so a stale page
+    // anywhere in a large buffer is eventually compared.
+    if (size > MaxCompare) {
+        const u32 windows = size / MaxCompare;
+        const u32 window = static_cast<u32>((content_check_cursor >> 12) % windows);
+        device_addr += u64{window} * MaxCompare;
+        size -= window * MaxCompare;
+    }
     const u32 compare_size = std::min(size, MaxCompare);
     if (compare_size == 0 || !buffer.IsInBounds(device_addr, compare_size)) {
         return;

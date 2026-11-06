@@ -257,8 +257,8 @@ public:
 
     /// Walks the physical backing of [address, address + size) and calls
     /// func(const u8* chunk, u64 chunk_size) for each contiguous piece, bypassing any guest page
-    /// protection. Returns false (without calling func) when the range has no full physical
-    /// backing. The read-side twin of TryWriteBacking: emulator-internal readers (e.g. content
+    /// protection. Returns false when the range is not fully backed; func may
+    /// already have been called for a backed prefix. The read-side twin of TryWriteBacking: emulator-internal readers (e.g. content
     /// hashing) must not fault through armed readback protection, and the bytes are identical to
     /// the protected view's.
     bool ForEachBackingChunk(const void* address, u64 size,

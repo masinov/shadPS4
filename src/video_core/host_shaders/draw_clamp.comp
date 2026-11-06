@@ -1,0 +1,41 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// Validates the arguments of a non-indexed indirect draw at execution time, as
+// dispatch_clamp.comp does for dispatches. A draw whose vertex or instance count is out of
+// range draws nothing.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcArgs {
+    uint src_args[4]; // vertexCount, instanceCount, firstVertex, firstInstance
+};
+
+layout(std430, binding = 1) writeonly buffer DstArgs {
+    uint dst_args[4];
+};
+
+layout(std430, binding = 2) buffer ClampCounter {
+    uint clamp_count;
+};
+
+// Far above anything one guest draw submits, and small enough to finish well inside the
+// hang timeout of the driver.
+const uint MaxVertices = 1u << 24;
+const uint MaxInstances = 1u << 16;
+
+void main() {
+    const uint vertices = src_args[0];
+    const uint instances = src_args[1];
+    const bool insane = vertices > MaxVertices || instances > MaxInstances ||
+                        (instances != 0u && vertices > MaxVertices / instances);
+    dst_args[0] = insane ? 0u : vertices;
+    dst_args[1] = insane ? 0u : instances;
+    dst_args[2] = src_args[2];
+    dst_args[3] = src_args[3];
+    if (insane) {
+        atomicAdd(clamp_count, 1u);
+    }
+}
